@@ -190,7 +190,10 @@ def _ease_in_out_cubic(t):
 class SmoothServo:
     """EMA-filtered head tracking with deadband."""
     DEADBAND_DEG = 2.0   # ignore changes smaller than 2 degrees total
-    EMA_ALPHA = 0.15     # smoothing factor (lower = smoother, 0.1-0.3 range)
+    # Autonomous tracking uses this immediate EMA path. A higher alpha
+    # lets the head counter-steer a fast body turn without reintroducing the
+    # blocking 350 ms eased movement used by manual head commands.
+    EMA_ALPHA = 0.45
 
     def __init__(self):
         self._current = [0.0, 0.0, 0.0]  # yaw, roll, pitch
