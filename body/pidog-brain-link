@@ -12,7 +12,7 @@ if [[ ! -r "$CONFIG" ]]; then
     exit 2
 fi
 
-# The configuration is installed root-owned and mode 600.
+# The configuration is installed root-owned and mode 640 so the david service account can read it.
 # shellcheck source=/dev/null
 source "$CONFIG"
 
