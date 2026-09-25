@@ -81,7 +81,7 @@ MAX_PITCH_STEP_DEGREES = 3.0
 # SunFounder's face-tracking example uses these working limits.
 YAW_LIMITS = (-80.0, 80.0)
 PITCH_LIMITS = (-30.0, 30.0)
-COMMAND_INTERVAL = 0.25
+COMMAND_INTERVAL = 0.10
 DEFAULT_TURN_YAW_THRESHOLD = 18.0
 DEFAULT_BODY_TURN_SCREEN_THRESHOLD = 0.18
 DEFAULT_TURN_COMMAND_INTERVAL = 0.75
@@ -567,7 +567,7 @@ def command_head(
     yaw: float,
     pitch: float,
 ) -> bool:
-    """Send one bounded head position command through the Pi bridge."""
+    """Send one smooth manual head-position command through the Pi bridge."""
 
     try:
         response = session.post(
@@ -584,6 +584,84 @@ def command_head(
     except (requests.RequestException, ValueError) as exc:
         print(f"Head command failed: {exc}")
         return False
+
+
+class LatestHeadController:
+    """Deliver only the newest autonomous head target on a worker thread."""
+
+    def __init__(self, robot_api: str):
+        self.robot_api = robot_api.rstrip("/")
+        self.condition = threading.Condition()
+        self.pending: tuple[float, float] | None = None
+        self.stopping = False
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.consecutive_failures = 0
+        self.last_error: str | None = None
+        self.error_generation = 0
+        self.reported_error_generation = 0
+        self.sent_count = 0
+
+    def start(self) -> None:
+        self.thread.start()
+
+    def stop(self) -> None:
+        with self.condition:
+            self.stopping = True
+            self.condition.notify_all()
+        self.thread.join(timeout=3)
+
+    def submit(self, yaw: float, pitch: float) -> None:
+        # A single pending slot is intentional: stale tracking positions must
+        # never execute after a newer camera observation has arrived.
+        with self.condition:
+            self.pending = (float(yaw), float(pitch))
+            self.condition.notify()
+
+    def consume_failure(self) -> tuple[int, str] | None:
+        with self.condition:
+            if self.error_generation == self.reported_error_generation:
+                return None
+            self.reported_error_generation = self.error_generation
+            return self.consecutive_failures, self.last_error or "unknown error"
+
+    def _run(self) -> None:
+        session = requests.Session()
+        try:
+            while True:
+                with self.condition:
+                    self.condition.wait_for(
+                        lambda: self.pending is not None or self.stopping
+                    )
+                    if self.stopping:
+                        return
+                    yaw, pitch = self.pending
+                    self.pending = None
+                try:
+                    response = session.post(
+                        f"{self.robot_api}/head",
+                        json={
+                            "yaw": yaw,
+                            "roll": 0,
+                            "pitch": pitch,
+                            "tracking": True,
+                        },
+                        timeout=(0.35, 1.0),
+                    )
+                    response.raise_for_status()
+                    payload = response.json()
+                    if payload.get("error"):
+                        raise RuntimeError(str(payload["error"]))
+                    with self.condition:
+                        self.consecutive_failures = 0
+                        self.last_error = None
+                        self.sent_count += 1
+                except (requests.RequestException, ValueError, RuntimeError) as exc:
+                    with self.condition:
+                        self.consecutive_failures += 1
+                        self.last_error = str(exc)
+                        self.error_generation += 1
+        finally:
+            session.close()
 
 
 VOICE_COMMANDS = {
@@ -1154,6 +1232,15 @@ def parse_args() -> argparse.Namespace:
         help="Step count for each admitted turn; three completes the gait.",
     )
     parser.add_argument(
+        "--turn-countersteer-degrees",
+        type=float,
+        default=12.0,
+        help=(
+            "Immediate opposite head-yaw correction when a body turn is "
+            "accepted; visual tracking continues to refine it."
+        ),
+    )
+    parser.add_argument(
         "--turn-speed",
         type=int,
         default=98,
@@ -1233,6 +1320,10 @@ def main() -> None:
         raise ValueError("--turn-interval must be at least 0.25 seconds")
     if not 1 <= args.turn_steps <= 3:
         raise ValueError("--turn-steps must be between 1 and 3")
+    if not 0.0 <= args.turn_countersteer_degrees <= 30.0:
+        raise ValueError(
+            "--turn-countersteer-degrees must be between 0 and 30"
+        )
     if not 20 <= args.turn_speed <= 100:
         raise ValueError("--turn-speed must be between 20 and 100")
     if not 1 <= args.forward_steps <= 3:
@@ -1277,6 +1368,8 @@ def main() -> None:
         )
     vlm = VLMObserver(args.vlm_model, args.max_new_tokens)
     robot_session = requests.Session()
+    head_controller = LatestHeadController(args.robot_api)
+    head_controller.start()
     camera = LatestFrameCamera(args.stream)
     camera.start()
 
@@ -1390,6 +1483,20 @@ def main() -> None:
             last_sequence = sequence
 
             now = time.perf_counter()
+            head_failure = head_controller.consume_failure()
+            if head_failure is not None:
+                failure_count, failure_reason = head_failure
+                print(
+                    f"[HEAD] tracking command failed ({failure_count}/3): "
+                    f"{failure_reason}"
+                )
+                if failure_count >= 3 and movement_enabled:
+                    movement_enabled = False
+                    turning_enabled = False
+                    print(
+                        "[HEAD] head and body following disarmed after three "
+                        "consecutive tracking-command failures"
+                    )
             if (
                 turning_enabled
                 and now - last_body_keep_awake_time
@@ -1637,21 +1744,9 @@ def main() -> None:
                         new_pitch = float(
                             np.clip(pitch + pitch_step, *PITCH_LIMITS)
                         )
-                        if command_head(
-                            robot_session,
-                            args.robot_api,
-                            new_yaw,
-                            new_pitch,
-                        ):
-                            yaw = new_yaw
-                            pitch = new_pitch
-                        else:
-                            movement_enabled = False
-                            turning_enabled = False
-                            print(
-                                "Head and body following disarmed because a head "
-                                "command failed"
-                            )
+                        head_controller.submit(new_yaw, new_pitch)
+                        yaw = new_yaw
+                        pitch = new_pitch
                     last_command_time = tracking_now
 
                 # Identity-follow experiment: first centre the selected person
@@ -1732,6 +1827,24 @@ def main() -> None:
                         if distance_cm is not None:
                             last_body_distance = distance_cm
                         if action_result == "accepted":
+                            if body_action in {"turn_left", "turn_right"}:
+                                countersteer_sign = (
+                                    1.0 if body_action == "turn_right" else -1.0
+                                )
+                                yaw = float(
+                                    np.clip(
+                                        yaw
+                                        + countersteer_sign
+                                        * args.turn_countersteer_degrees,
+                                        *YAW_LIMITS,
+                                    )
+                                )
+                                head_controller.submit(yaw, pitch)
+                                print(
+                                    "[HEAD] turn countersteer "
+                                    f"{body_action}: yaw={yaw:+.1f}deg; "
+                                    "visual corrections remain active"
+                                )
                             if body_safety_stopped:
                                 print(
                                     "Ultrasonic clearance restored; following resumed"
@@ -2462,6 +2575,7 @@ def main() -> None:
                     else:
                         print("VLM inference already running; request ignored")
     finally:
+        head_controller.stop()
         camera.stop()
         robot_session.close()
         cv2.destroyAllWindows()
