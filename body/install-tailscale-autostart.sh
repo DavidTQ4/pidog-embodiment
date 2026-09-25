@@ -20,6 +20,8 @@ done
 
 command -v tailscale >/dev/null 2>&1 ||
     fail "Tailscale is not installed. Install it first, then run this installer again."
+command -v ssh >/dev/null 2>&1 || fail "OpenSSH client is not installed"
+command -v ssh-keygen >/dev/null 2>&1 || fail "ssh-keygen is not installed"
 
 log "installing PiDog boot components"
 install -m 755 "$REPO_BODY/pidog-start" /usr/local/sbin/pidog-start
