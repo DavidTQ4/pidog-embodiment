@@ -33,7 +33,6 @@ PHRASE_TO_COMMAND = {
     "track me": "arm_head",
     "follow me": "follow_me",
     "stop": "stop",
-    "halt": "stop",
     "emergency stop": "stop",
     "lie down": "lie_down",
     "lay down": "lie_down",
@@ -82,7 +81,19 @@ def parse_args() -> argparse.Namespace:
         "--stop-without-wake",
         action=argparse.BooleanOptionalAction,
         default=os.environ.get("NOX_STOP_WITHOUT_WAKE", "1") != "0",
-        help="Accept bare 'stop'/'halt'. A false positive only stops motion.",
+        help="Accept bare 'stop' as a fail-safe.",
+    )
+    parser.add_argument(
+        "--minimum-confidence",
+        type=float,
+        default=float(os.environ.get("NOX_VOICE_MIN_CONFIDENCE", "0.60")),
+        help="Minimum mean Vosk confidence for wake-word commands.",
+    )
+    parser.add_argument(
+        "--bare-stop-minimum-confidence",
+        type=float,
+        default=float(os.environ.get("NOX_BARE_STOP_MIN_CONFIDENCE", "0.72")),
+        help="Higher minimum confidence for a stop without the wake word.",
     )
     return parser.parse_args()
 
@@ -125,7 +136,7 @@ def grammar_phrases(stop_without_wake: bool) -> list[str]:
         for phrase in PHRASE_TO_COMMAND
     ]
     if stop_without_wake:
-        phrases.extend(("stop", "halt", "emergency stop"))
+        phrases.extend(("stop", "emergency stop"))
     phrases.append("[unk]")
     return phrases
 
@@ -138,7 +149,7 @@ def canonical_command(text: str, stop_without_wake: bool) -> str | None:
         phrase = " ".join(words[1:])
         return PHRASE_TO_COMMAND.get(phrase)
     phrase = " ".join(words)
-    if stop_without_wake and phrase in {"stop", "halt", "emergency stop"}:
+    if stop_without_wake and phrase in {"stop", "emergency stop"}:
         return "stop"
     return None
 
@@ -267,6 +278,12 @@ def main() -> int:
         raise ValueError("--gain must be between 0.25 and 20")
     if args.debounce_seconds < 0.5:
         raise ValueError("--debounce-seconds must be at least 0.5")
+    if not 0.0 <= args.minimum_confidence <= 1.0:
+        raise ValueError("--minimum-confidence must be between 0 and 1")
+    if not 0.0 <= args.bare_stop_minimum_confidence <= 1.0:
+        raise ValueError(
+            "--bare-stop-minimum-confidence must be between 0 and 1"
+        )
 
     model_path = discover_model(args.model)
     SetLogLevel(-1)
@@ -337,8 +354,31 @@ def main() -> int:
             text = " ".join(result.get("text", "").split())
             command = canonical_command(text, args.stop_without_wake)
             if command is None:
-                if text and text != "[unk]":
+                # Vosk often finalises a trailing fragment such as "head"
+                # separately from "Nox arm head". These fragments have no
+                # command authority and do not need to flood the journal.
+                harmless_fragments = {
+                    "nox", "knox", "knocks", "head", "arm", "track", "me"
+                }
+                if text and text != "[unk]" and text not in harmless_fragments:
                     print(f"[voice] Ignored: {text!r}", flush=True)
+                continue
+
+            confidence = result_confidence(result)
+            words = text.lower().strip().split()
+            has_wake_word = bool(words and words[0] in WAKE_WORDS)
+            minimum_confidence = (
+                args.minimum_confidence
+                if has_wake_word
+                else args.bare_stop_minimum_confidence
+            )
+            if confidence is None or confidence < minimum_confidence:
+                print(
+                    f"[voice] REJECTED low-confidence command: text={text!r} "
+                    f"command={command} confidence={confidence} "
+                    f"required={minimum_confidence:.2f}",
+                    flush=True,
+                )
                 continue
 
             now = time.monotonic()
@@ -348,7 +388,6 @@ def main() -> int:
             last_command = command
             last_command_time = now
 
-            confidence = result_confidence(result)
             local_action, local_result = run_local_action(args, command)
             relayed = relay_command(
                 args,
