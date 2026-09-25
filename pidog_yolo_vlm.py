@@ -25,6 +25,11 @@ from __future__ import annotations
 
 import argparse
 import json
+
+try:
+    import av
+except ImportError:
+    av = None
 import textwrap
 import threading
 import time
@@ -158,7 +163,53 @@ class LatestFrameCamera:
         finally:
             session.close()
 
+    def _run_h264(self) -> None:
+        """Decode a low-latency raw H.264 TCP stream, retaining one frame."""
+        if av is None:
+            with self.lock:
+                self.error = (
+                    "H.264 mode requires PyAV; install it with: python -m pip install av"
+                )
+            return
+
+        while not self.stop_event.is_set():
+            container = None
+            try:
+                container = av.open(
+                    self.url,
+                    format="h264",
+                    mode="r",
+                    options={
+                        "fflags": "nobuffer",
+                        "flags": "low_delay",
+                        "probesize": "32",
+                        "analyzeduration": "0",
+                    },
+                    timeout=(5.0, 5.0),
+                )
+                with self.lock:
+                    self.error = None
+                for decoded in container.decode(video=0):
+                    if self.stop_event.is_set():
+                        break
+                    frame = decoded.to_ndarray(format="bgr24")
+                    with self.lock:
+                        self.frame = frame
+                        self.sequence += 1
+                        self.error = None
+            except Exception as exc:
+                with self.lock:
+                    self.error = f"H.264 stream interrupted: {exc}"
+                self.stop_event.wait(0.5)
+            finally:
+                if container is not None:
+                    container.close()
+
     def _run(self) -> None:
+        if self.url.lower().startswith("tcp://"):
+            self._run_h264()
+            return
+
         if self.url.lower().split("?", 1)[0].endswith((".jpg", ".jpeg")):
             self._run_snapshot()
             return

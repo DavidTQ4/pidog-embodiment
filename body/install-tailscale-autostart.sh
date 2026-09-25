@@ -14,7 +14,7 @@ fail() { printf '[install-tailscale] ERROR: %s\n' "$*" >&2; exit 1; }
 
 [[ ${EUID} -eq 0 ]] || fail "run with sudo"
 [[ -d "$REPO_BODY" ]] || fail "missing $REPO_BODY"
-for file in pidog-start pidog-boot.service pidog-brain-link pidog-brain-link.service pidog-brain-link.env.example; do
+for file in pidog-start pidog-boot.service pidog-brain-link pidog-brain-link.service pidog-brain-link.env.example pidog-h264.service pidog-camera-mode; do
     [[ -f "$REPO_BODY/$file" ]] || fail "missing $REPO_BODY/$file"
 done
 
@@ -28,6 +28,8 @@ install -m 755 "$REPO_BODY/pidog-start" /usr/local/sbin/pidog-start
 install -m 644 "$REPO_BODY/pidog-boot.service" /etc/systemd/system/pidog-boot.service
 install -m 755 "$REPO_BODY/pidog-brain-link" /usr/local/sbin/pidog-brain-link
 install -m 644 "$REPO_BODY/pidog-brain-link.service" /etc/systemd/system/pidog-brain-link.service
+install -m 644 "$REPO_BODY/pidog-h264.service" /etc/systemd/system/pidog-h264.service
+install -m 755 "$REPO_BODY/pidog-camera-mode" /usr/local/sbin/pidog-camera-mode
 
 install -d -m 700 -o "$PI_USER" -g "$PI_USER" "$PI_HOME/.ssh"
 if [[ ! -f "$KEY" ]]; then
