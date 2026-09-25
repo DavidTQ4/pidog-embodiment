@@ -16,27 +16,52 @@ import traceback
 import math
 from pathlib import Path
 
-# Audio config for HifiBerry DAC (auto-detect card number)
+# Audio output is selected by stable ALSA card ID, not its boot-dependent
+# numeric index. PiDog V2 commonly exposes the speaker as a Google Voice HAT.
 os.environ["SDL_AUDIODRIVER"] = "alsa"
 
-def _find_hifiberry_card():
-    """Auto-detect HifiBerry DAC ALSA card number."""
+def _find_playback_device():
+    """Detect the robot speaker using stable ALSA identifiers."""
+    import re
     import subprocess as _sp
-    try:
-        result = _sp.run(["aplay", "-l"], capture_output=True, text=True, timeout=5)
-        for line in result.stdout.splitlines():
-            if "hifiberry" in line.lower() and "card" in line.lower():
-                card = line.split("card ")[1].split(":")[0]
-                print(f"[nox] HifiBerry DAC found at card {card}", flush=True)
-                return f"plughw:{card},0"
-    except Exception as e:
-        print(f"[nox] HifiBerry detection error: {e}", flush=True)
-    # Fallback: try card 3 (typical Pi 4 with HifiBerry)
-    print("[nox] HifiBerry not found, falling back to plughw:3,0", flush=True)
-    return "plughw:3,0"
 
-# nox.env may pin AUDIODEV for robots whose speaker isn't auto-detectable
-_PLAYBACK_DEVICE = os.environ.get("AUDIODEV") or _find_hifiberry_card()
+    preferred_ids = (
+        "sndrpigooglevoi",
+        "sndrpihifiberry",
+        "hifiberry",
+        "robothat",
+    )
+    try:
+        result = _sp.run(
+            ["aplay", "-l"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        for line in result.stdout.splitlines():
+            match = re.match(r"card\s+\d+:\s+([^\s]+)\s+\[", line.strip())
+            if not match:
+                continue
+            card_id = match.group(1)
+            lowered = line.lower()
+            if any(candidate in lowered for candidate in preferred_ids):
+                device = f"plughw:CARD={card_id},DEV=0"
+                print(
+                    f"[nox] Robot speaker found: {card_id} -> {device}",
+                    flush=True,
+                )
+                return device
+    except Exception as exc:
+        print(f"[nox] Speaker detection error: {exc}", flush=True)
+
+    # ALSA's configured default is safer than guessing a numeric card, which
+    # can silently route sound to HDMI or the headphone socket after reboot.
+    print("[nox] Robot speaker not identified; using ALSA default", flush=True)
+    return "default"
+
+# nox.env may pin AUDIODEV for robots whose speaker isn't auto-detectable.
+_PLAYBACK_DEVICE = os.environ.get("AUDIODEV") or _find_playback_device()
 os.environ["AUDIODEV"] = _PLAYBACK_DEVICE
 
 SOCKET_PATH = "/tmp/nox.sock"
