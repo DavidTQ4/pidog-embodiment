@@ -34,8 +34,11 @@ if [[ ! -f "$KEY" ]]; then
 fi
 
 if [[ ! -e "$CONFIG" ]]; then
-    install -m 600 -o root -g root "$REPO_BODY/pidog-brain-link.env.example" "$CONFIG"
+    install -m 640 -o root -g "$PI_USER" "$REPO_BODY/pidog-brain-link.env.example" "$CONFIG"
 fi
+
+chown root:"$PI_USER" "$CONFIG"
+chmod 640 "$CONFIG"
 
 if [[ -n "$BRAIN_HOST" ]]; then
     sed -i "s/^PIDOG_BRAIN_HOST=.*/PIDOG_BRAIN_HOST=$BRAIN_HOST/" "$CONFIG"
