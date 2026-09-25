@@ -782,6 +782,54 @@ def fetch_voice_commands(
     return commands
 
 
+class VoiceCommandPoller:
+    """Poll the Pi voice inbox without blocking the vision/control loop."""
+
+    def __init__(self, robot_api: str, interval: float):
+        self.robot_api = robot_api
+        self.interval = interval
+        self.commands: deque[tuple[str, dict[str, object]]] = deque()
+        self.error: str | None = None
+        self.lock = threading.Lock()
+        self.stop_event = threading.Event()
+        self.thread = threading.Thread(target=self._run, daemon=True)
+
+    def start(self) -> None:
+        self.thread.start()
+
+    def stop(self) -> None:
+        self.stop_event.set()
+        self.thread.join(timeout=2)
+
+    def drain(
+        self,
+    ) -> tuple[list[tuple[str, dict[str, object]]], str | None]:
+        with self.lock:
+            commands = list(self.commands)
+            self.commands.clear()
+            error = self.error
+            self.error = None
+        return commands, error
+
+    def _run(self) -> None:
+        session = requests.Session()
+        try:
+            while not self.stop_event.is_set():
+                try:
+                    commands = fetch_voice_commands(session, self.robot_api)
+                    with self.lock:
+                        self.commands.extend(commands)
+                        self.error = None
+                except requests.RequestException as exc:
+                    with self.lock:
+                        self.error = str(exc)
+
+                if self.stop_event.wait(self.interval):
+                    break
+        finally:
+            session.close()
+
+
 def command_body_action(
     session: requests.Session,
     robot_api: str,
@@ -1458,7 +1506,7 @@ def main() -> None:
     identity_labels: dict[int, tuple[str, float]] = {}
     follow_log = FollowStateLogger()
     voice_command_queue: deque[tuple[str, dict[str, object]]] = deque()
-    last_voice_poll_time = 0.0
+    voice_poller: VoiceCommandPoller | None = None
     last_voice_error_log_time = 0.0
 
     print(
@@ -1470,9 +1518,14 @@ def main() -> None:
     if args.disable_voice_commands:
         print("Pi voice-command polling disabled")
     else:
+        voice_poller = VoiceCommandPoller(
+            args.robot_api,
+            args.voice_poll_interval,
+        )
+        voice_poller.start()
         print(
-            "Voice commands enabled: select me | arm head | follow me | "
-            "stop | lie down"
+            "Voice commands enabled asynchronously: select me | arm head | "
+            "follow me | stop | lie down"
         )
     try:
         deadline = time.monotonic() + 15
@@ -2299,24 +2352,20 @@ def main() -> None:
             cv2.imshow("PiDog YOLO + Qwen VLM", display_frame)
             key = cv2.waitKey(1) & 0xFF
 
-            # Polling is deliberately lightweight and separate from camera
-            # transport.  Safety commands have already been executed locally
-            # by the Pi; consuming them here disarms the desktop controller so
-            # it cannot admit another gait.
+            # The worker performs all voice-inbox network I/O. Safety
+            # commands have already been executed locally by the Pi; consuming
+            # them here disarms the desktop controller so it cannot admit
+            # another gait.
             voice_now = time.perf_counter()
-            if (
-                not args.disable_voice_commands
-                and voice_now - last_voice_poll_time >= args.voice_poll_interval
-            ):
-                last_voice_poll_time = voice_now
-                try:
-                    voice_command_queue.extend(
-                        fetch_voice_commands(robot_session, args.robot_api)
-                    )
-                except requests.RequestException as exc:
-                    if voice_now - last_voice_error_log_time >= 10.0:
-                        print(f"Voice inbox unavailable: {exc}")
-                        last_voice_error_log_time = voice_now
+            if voice_poller is not None:
+                new_voice_commands, voice_error = voice_poller.drain()
+                voice_command_queue.extend(new_voice_commands)
+                if (
+                    voice_error is not None
+                    and voice_now - last_voice_error_log_time >= 10.0
+                ):
+                    print(f"Voice inbox unavailable: {voice_error}")
+                    last_voice_error_log_time = voice_now
 
             if voice_command_queue:
                 voice_command, voice_message = voice_command_queue.popleft()
@@ -2627,6 +2676,8 @@ def main() -> None:
                     else:
                         print("VLM inference already running; request ignored")
     finally:
+        if voice_poller is not None:
+            voice_poller.stop()
         head_controller.stop()
         camera.stop()
         robot_session.close()
