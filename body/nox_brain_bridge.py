@@ -774,13 +774,18 @@ class BridgeHandler(BaseHTTPRequestHandler):
             self._send_json(r)
         
         elif path == "/head":
-            # Move head
+            # Manual moves retain the smooth eased path. Autonomous tracking
+            # uses the daemon's immediate EMA path so a leg gait cannot starve
+            # camera counter-steering for 350 ms per update.
+            tracking = bool(body.get("tracking", False))
             r = send_to_daemon({
-                "cmd": "head",
+                "cmd": "head_ema" if tracking else "head",
                 "yaw": body.get("yaw", 0),
                 "roll": body.get("roll", 0),
                 "pitch": body.get("pitch", 0),
             })
+            if isinstance(r, dict):
+                r["tracking"] = tracking
             self._send_json(r)
         
         elif path == "/face/register":
