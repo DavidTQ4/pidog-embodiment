@@ -1,0 +1,130 @@
+#!/usr/bin/env bash
+set -uo pipefail
+
+SERVICES=(nox-body.service nox-bridge.service nox-voice.service)
+BRIDGE_HOST=127.0.0.1
+BRIDGE_PORT=8888
+CAMERA_PORT=9000
+WARM_FRAME=/tmp/pidog-camera-warmup.jpg
+
+log()  { printf '[pidog-start] %s\n' "$*"; }
+fail() { printf '[pidog-start] ERROR: %s\n' "$*" >&2; exit 1; }
+
+[[ ${EUID} -eq 0 ]] || fail "run with sudo"
+
+for unit in "${SERVICES[@]}"; do
+    systemctl cat "$unit" >/dev/null 2>&1 || fail "$unit is not installed"
+done
+
+log "enabling PiDog services"
+systemctl enable "${SERVICES[@]}" >/dev/null
+
+log "starting body controller"
+systemctl start nox-body.service || fail "could not start nox-body.service"
+for _ in {1..20}; do
+    systemctl is-active --quiet nox-body.service && break
+    sleep 0.5
+done
+systemctl is-active --quiet nox-body.service || {
+    journalctl -u nox-body.service -n 20 --no-pager -l >&2
+    fail "body controller did not become active"
+}
+
+log "starting HTTP bridge"
+systemctl start nox-bridge.service || fail "could not start nox-bridge.service"
+for _ in {1..20}; do
+    if python3 - "$BRIDGE_HOST" "$BRIDGE_PORT" <<'PY' >/dev/null 2>&1
+import socket, sys
+with socket.create_connection((sys.argv[1], int(sys.argv[2])), timeout=0.5):
+    pass
+PY
+    then
+        break
+    fi
+    sleep 0.5
+done
+
+python3 - "$BRIDGE_HOST" "$BRIDGE_PORT" <<'PY' >/dev/null 2>&1 || {
+import socket, sys
+with socket.create_connection((sys.argv[1], int(sys.argv[2])), timeout=2):
+    pass
+PY
+    journalctl -u nox-bridge.service -n 20 --no-pager -l >&2
+    fail "HTTP bridge did not open port $BRIDGE_PORT"
+}
+
+log "starting offline voice service"
+systemctl start nox-voice.service || fail "could not start nox-voice.service"
+for _ in {1..20}; do
+    systemctl is-active --quiet nox-voice.service && break
+    sleep 0.5
+done
+systemctl is-active --quiet nox-voice.service || {
+    journalctl -u nox-voice.service -n 20 --no-pager -l >&2
+    fail "offline voice service did not become active"
+}
+
+log "warming camera (the first frame can take several seconds)"
+rm -f "$WARM_FRAME"
+camera_ok=0
+for attempt in 1 2 3; do
+    if python3 - "$WARM_FRAME" <<'PY'
+import sys
+import urllib.request
+
+destination = sys.argv[1]
+try:
+    with urllib.request.urlopen("http://127.0.0.1:8888/frame.jpg", timeout=20) as response:
+        payload = response.read()
+        content_type = response.headers.get("Content-Type", "")
+        if response.status != 200 or "image/jpeg" not in content_type or len(payload) < 1000:
+            raise RuntimeError(
+                f"unexpected response: status={response.status}, "
+                f"type={content_type!r}, bytes={len(payload)}"
+            )
+    with open(destination, "wb") as output:
+        output.write(payload)
+    print(f"[pidog-start] camera frame ready ({len(payload)} bytes)")
+except Exception as exc:
+    print(f"[pidog-start] camera attempt failed: {exc}", file=sys.stderr)
+    raise SystemExit(1)
+PY
+    then
+        camera_ok=1
+        break
+    fi
+    log "retrying camera ($attempt/3)"
+    sleep 2
+done
+
+if [[ $camera_ok -ne 1 ]]; then
+    journalctl -u nox-body.service -u nox-bridge.service -n 35 --no-pager -l >&2
+    fail "camera warm-up failed"
+fi
+
+stream_ok=0
+for _ in {1..20}; do
+    if python3 - "$CAMERA_PORT" <<'PY' >/dev/null 2>&1
+import socket, sys
+with socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=0.5):
+    pass
+PY
+    then
+        stream_ok=1
+        break
+    fi
+    sleep 0.5
+done
+
+log "service state:"
+for unit in "${SERVICES[@]}"; do
+    printf '  %-22s %s\n' "$unit" "$(systemctl is-active "$unit" 2>/dev/null || true)"
+done
+printf '  %-22s %s\n' "bridge :$BRIDGE_PORT" "ready"
+if [[ $stream_ok -eq 1 ]]; then
+    printf '  %-22s %s\n' "camera :$CAMERA_PORT" "ready"
+else
+    fail "frame capture worked, but camera stream port $CAMERA_PORT did not open"
+fi
+
+log "PiDog local services and camera are ready"
