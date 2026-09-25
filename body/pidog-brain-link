@@ -12,7 +12,6 @@ if [[ ! -r "$CONFIG" ]]; then
     exit 2
 fi
 
-# The configuration is installed root-owned and mode 640 so the david service account can read it.
 # shellcheck source=/dev/null
 source "$CONFIG"
 
@@ -22,12 +21,16 @@ source "$CONFIG"
 PIDOG_BRAIN_IDENTITY=${PIDOG_BRAIN_IDENTITY:-/home/david/.ssh/pidog_brain_ed25519}
 PIDOG_REMOTE_BRIDGE_PORT=${PIDOG_REMOTE_BRIDGE_PORT:-18888}
 PIDOG_REMOTE_CAMERA_PORT=${PIDOG_REMOTE_CAMERA_PORT:-19000}
+PIDOG_REMOTE_SSH_PORT=${PIDOG_REMOTE_SSH_PORT:-10022}
 PIDOG_LOCAL_BRIDGE_HOST=${PIDOG_LOCAL_BRIDGE_HOST:-127.0.0.1}
 PIDOG_LOCAL_BRIDGE_PORT=${PIDOG_LOCAL_BRIDGE_PORT:-8888}
 PIDOG_LOCAL_CAMERA_HOST=${PIDOG_LOCAL_CAMERA_HOST:-127.0.0.1}
 PIDOG_LOCAL_CAMERA_PORT=${PIDOG_LOCAL_CAMERA_PORT:-9000}
 
-for value in     "$PIDOG_REMOTE_BRIDGE_PORT" "$PIDOG_REMOTE_CAMERA_PORT"     "$PIDOG_LOCAL_BRIDGE_PORT" "$PIDOG_LOCAL_CAMERA_PORT"; do
+for value in \
+    "$PIDOG_REMOTE_BRIDGE_PORT" "$PIDOG_REMOTE_CAMERA_PORT" \
+    "$PIDOG_REMOTE_SSH_PORT" "$PIDOG_LOCAL_BRIDGE_PORT" \
+    "$PIDOG_LOCAL_CAMERA_PORT"; do
     [[ "$value" =~ ^[0-9]+$ ]] && (( value >= 1 && value <= 65535 )) || {
         log "invalid TCP port: $value"
         exit 2
@@ -41,11 +44,54 @@ fi
 
 log "waiting for Tailscale"
 until tailscale status --json 2>/dev/null |
-    python3 -c 'import json,sys; raise SystemExit(0 if json.load(sys.stdin).get("BackendState") == "Running" else 1)'     2>/dev/null; do
+    python3 -c 'import json,sys; raise SystemExit(0 if json.load(sys.stdin).get("BackendState") == "Running" else 1)' \
+    2>/dev/null; do
     sleep 5
 done
 
-log "Tailscale is ready; connecting to ${PIDOG_BRAIN_USER}@${PIDOG_BRAIN_HOST}"
-log "desktop endpoints will be 127.0.0.1:${PIDOG_REMOTE_BRIDGE_PORT} and 127.0.0.1:${PIDOG_REMOTE_CAMERA_PORT}"
+SSH_COMMON=(
+    -N -T
+    -o BatchMode=yes
+    -o ConnectTimeout=10
+    -o ConnectionAttempts=1
+    -o ServerAliveInterval=15
+    -o ServerAliveCountMax=3
+    -o ExitOnForwardFailure=yes
+    -o StrictHostKeyChecking=accept-new
+    -o UserKnownHostsFile=/home/david/.ssh/pidog_brain_known_hosts
+    -o IdentitiesOnly=yes
+    -i "$PIDOG_BRAIN_IDENTITY"
+)
+DESTINATION="${PIDOG_BRAIN_USER}@${PIDOG_BRAIN_HOST}"
 
-exec /usr/bin/ssh     -N -T     -o BatchMode=yes     -o ConnectTimeout=10     -o ConnectionAttempts=1     -o ServerAliveInterval=15     -o ServerAliveCountMax=3     -o ExitOnForwardFailure=yes     -o StrictHostKeyChecking=accept-new     -o UserKnownHostsFile=/home/david/.ssh/pidog_brain_known_hosts     -o IdentitiesOnly=yes     -i "$PIDOG_BRAIN_IDENTITY"     -R "127.0.0.1:${PIDOG_REMOTE_BRIDGE_PORT}:${PIDOG_LOCAL_BRIDGE_HOST}:${PIDOG_LOCAL_BRIDGE_PORT}"     -R "127.0.0.1:${PIDOG_REMOTE_CAMERA_PORT}:${PIDOG_LOCAL_CAMERA_HOST}:${PIDOG_LOCAL_CAMERA_PORT}"     "${PIDOG_BRAIN_USER}@${PIDOG_BRAIN_HOST}"
+log "Tailscale is ready; connecting to $DESTINATION"
+log "control/voice: desktop 127.0.0.1:${PIDOG_REMOTE_BRIDGE_PORT}"
+log "administration: desktop 127.0.0.1:${PIDOG_REMOTE_SSH_PORT}"
+log "camera (independent connection): desktop 127.0.0.1:${PIDOG_REMOTE_CAMERA_PORT}"
+
+control_pid=
+camera_pid=
+
+cleanup() {
+    trap - EXIT INT TERM
+    [[ -n "$control_pid" ]] && kill "$control_pid" 2>/dev/null || true
+    [[ -n "$camera_pid" ]] && kill "$camera_pid" 2>/dev/null || true
+    wait 2>/dev/null || true
+}
+trap cleanup EXIT INT TERM
+
+# Keep control traffic off the high-bandwidth MJPEG TCP stream. Separate SSH
+# connections prevent video congestion from delaying voice and head commands.
+/usr/bin/ssh "${SSH_COMMON[@]}" \
+    -R "127.0.0.1:${PIDOG_REMOTE_BRIDGE_PORT}:${PIDOG_LOCAL_BRIDGE_HOST}:${PIDOG_LOCAL_BRIDGE_PORT}" \
+    -R "127.0.0.1:${PIDOG_REMOTE_SSH_PORT}:127.0.0.1:22" \
+    "$DESTINATION" &
+control_pid=$!
+
+/usr/bin/ssh "${SSH_COMMON[@]}" \
+    -R "127.0.0.1:${PIDOG_REMOTE_CAMERA_PORT}:${PIDOG_LOCAL_CAMERA_HOST}:${PIDOG_LOCAL_CAMERA_PORT}" \
+    "$DESTINATION" &
+camera_pid=$!
+
+# If either link fails, end the other one so systemd restarts both as a pair.
+wait -n "$control_pid" "$camera_pid"
