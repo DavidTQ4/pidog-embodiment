@@ -95,7 +95,18 @@ MIN_POSE_BOX_IOU = 0.25
 
 
 class LatestFrameCamera:
-    """Continuously decode MJPEG while retaining only the newest frame."""
+    """Continuously decode HTTP MJPEG while retaining only the newest frame.
+
+    OpenCV/FFmpeg's ``VideoCapture`` can build a substantial internal buffer on
+    higher-latency links. Reading the multipart byte stream directly keeps the
+    camera thread aligned with arrived frames and avoids processing a stale
+    queue.
+    """
+
+    JPEG_START = b"\xff\xd8"
+    JPEG_END = b"\xff\xd9"
+    STREAM_CHUNK_BYTES = 16 * 1024
+    MAX_BUFFER_BYTES = 8 * 1024 * 1024
 
     def __init__(self, url: str):
         self.url = url
@@ -118,38 +129,76 @@ class LatestFrameCamera:
             frame = None if self.frame is None else self.frame.copy()
             return self.sequence, frame, self.error
 
-    def _open(self) -> cv2.VideoCapture:
-        capture = cv2.VideoCapture(self.url, cv2.CAP_FFMPEG)
-        if not capture.isOpened():
-            capture.release()
-            capture = cv2.VideoCapture(self.url)
-        capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        return capture
-
     def _run(self) -> None:
         while not self.stop_event.is_set():
-            capture = self._open()
-            if not capture.isOpened():
+            try:
+                response = requests.get(
+                    self.url,
+                    stream=True,
+                    timeout=(5, 10),
+                )
+                response.raise_for_status()
+            except requests.RequestException as exc:
                 with self.lock:
-                    self.error = f"Could not open stream: {self.url}"
+                    self.error = f"Could not open stream: {exc}"
                 time.sleep(1)
                 continue
 
             with self.lock:
                 self.error = None
 
-            while not self.stop_event.is_set():
-                ok, frame = capture.read()
-                if not ok or frame is None:
-                    with self.lock:
-                        self.error = "Stream stopped; reconnecting"
-                    break
-                with self.lock:
-                    self.frame = frame
-                    self.sequence += 1
-                    self.error = None
+            buffer = bytearray()
+            try:
+                for chunk in response.iter_content(self.STREAM_CHUNK_BYTES):
+                    if self.stop_event.is_set():
+                        break
+                    if not chunk:
+                        continue
 
-            capture.release()
+                    buffer.extend(chunk)
+                    while True:
+                        start = buffer.find(self.JPEG_START)
+                        if start < 0:
+                            # Retain one byte in case a JPEG marker is split
+                            # across adjacent HTTP chunks.
+                            if len(buffer) > 1:
+                                del buffer[:-1]
+                            break
+
+                        end = buffer.find(self.JPEG_END, start + 2)
+                        if end < 0:
+                            if start:
+                                del buffer[:start]
+                            if len(buffer) > self.MAX_BUFFER_BYTES:
+                                buffer.clear()
+                                with self.lock:
+                                    self.error = (
+                                        "Oversized/incomplete MJPEG frame; "
+                                        "resynchronising"
+                                    )
+                            break
+
+                        jpeg = bytes(buffer[start : end + 2])
+                        del buffer[: end + 2]
+                        frame = cv2.imdecode(
+                            np.frombuffer(jpeg, dtype=np.uint8),
+                            cv2.IMREAD_COLOR,
+                        )
+                        if frame is None:
+                            continue
+                        with self.lock:
+                            self.frame = frame
+                            self.sequence += 1
+                            self.error = None
+            except requests.RequestException as exc:
+                with self.lock:
+                    self.error = f"Stream interrupted ({exc}); reconnecting"
+            finally:
+                response.close()
+
+            if not self.stop_event.is_set() and self.error is None:
+                with self.lock:
+                    self.error = "Stream stopped; reconnecting"
             if not self.stop_event.is_set():
                 time.sleep(0.5)
 
