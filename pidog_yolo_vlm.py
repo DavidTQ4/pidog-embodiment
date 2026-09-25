@@ -1692,9 +1692,12 @@ def main() -> None:
                 if (
                     movement_enabled
                     and target_is_valid
-                    and selected_seen_count >= PERSON_CONFIRM_FRAMES
                     and tracking_now - last_command_time >= COMMAND_INTERVAL
                 ):
+                    # Once armed, head recovery is intentionally immediate.
+                    # Body gait admission below still requires five stable
+                    # frames, but one blurred turn frame must not freeze the
+                    # camera for the whole reacquisition confirmation window.
                     current_head_pose = matched_head_pose(
                         target,
                         pose_state,
