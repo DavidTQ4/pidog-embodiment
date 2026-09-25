@@ -5,7 +5,7 @@ MJPEG stream and accepts deliberately bounded head-position commands. Movement
 starts disarmed and selecting a person never arms it.
 
 Expected SSH forward:
-  http://127.0.0.1:19000/mjpg -> Pi 127.0.0.1:9000/mjpg
+  http://127.0.0.1:19000/mjpg.jpg -> Pi 127.0.0.1:9000/mjpg.jpg
 
 Controls:
   V / Space  Ask Qwen about the newest clean frame and current YOLO tracks
@@ -51,7 +51,7 @@ from pidog_face_identity import (
 )
 
 
-DEFAULT_STREAM = "http://127.0.0.1:19000/mjpg"
+DEFAULT_STREAM = "http://127.0.0.1:19000/mjpg.jpg"
 DEFAULT_ROBOT_API = "http://127.0.0.1:18888"
 DEFAULT_VLM_MODEL = "Qwen/Qwen3-VL-4B-Instruct"
 DEFAULT_YOLO_MODEL = "yolo11n.pt"
@@ -129,7 +129,40 @@ class LatestFrameCamera:
             frame = None if self.frame is None else self.frame.copy()
             return self.sequence, frame, self.error
 
+    def _run_snapshot(self) -> None:
+        """Repeatedly request ViLib's current JPEG without building a backlog."""
+        session = requests.Session()
+        try:
+            while not self.stop_event.is_set():
+                try:
+                    response = session.get(
+                        self.url,
+                        headers={"Cache-Control": "no-cache"},
+                        timeout=(5, 5),
+                    )
+                    response.raise_for_status()
+                    frame = cv2.imdecode(
+                        np.frombuffer(response.content, dtype=np.uint8),
+                        cv2.IMREAD_COLOR,
+                    )
+                    if frame is None:
+                        raise ValueError("camera returned an invalid JPEG")
+                    with self.lock:
+                        self.frame = frame
+                        self.sequence += 1
+                        self.error = None
+                except (requests.RequestException, ValueError) as exc:
+                    with self.lock:
+                        self.error = f"Latest-frame request failed: {exc}"
+                    self.stop_event.wait(0.2)
+        finally:
+            session.close()
+
     def _run(self) -> None:
+        if self.url.lower().split("?", 1)[0].endswith((".jpg", ".jpeg")):
+            self._run_snapshot()
+            return
+
         while not self.stop_event.is_set():
             try:
                 response = requests.get(
