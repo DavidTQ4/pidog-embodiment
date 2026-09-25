@@ -4,8 +4,11 @@ All visual processing runs on the desktop GPU. The Raspberry Pi provides the
 MJPEG stream and accepts deliberately bounded head-position commands. Movement
 starts disarmed and selecting a person never arms it.
 
-Expected SSH forward:
-  http://127.0.0.1:19000/mjpg.jpg -> Pi 127.0.0.1:9000/mjpg.jpg
+Default camera transport:
+  tcp://127.0.0.1:19001 -> Pi 127.0.0.1:9001 (raw hardware H.264)
+
+Explicit snapshot/MJPEG fallback:
+  --stream http://127.0.0.1:19000/mjpg.jpg
 
 Controls:
   V / Space  Ask Qwen about the newest clean frame and current YOLO tracks
@@ -56,7 +59,7 @@ from pidog_face_identity import (
 )
 
 
-DEFAULT_STREAM = "http://127.0.0.1:19000/mjpg.jpg"
+DEFAULT_STREAM = "tcp://127.0.0.1:19001"
 DEFAULT_ROBOT_API = "http://127.0.0.1:18888"
 DEFAULT_VLM_MODEL = "Qwen/Qwen3-VL-4B-Instruct"
 DEFAULT_YOLO_MODEL = "yolo11n.pt"
@@ -1350,7 +1353,15 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="PiDog YOLO tracker with asynchronous Qwen3-VL reasoning."
     )
-    parser.add_argument("--stream", default=DEFAULT_STREAM)
+    parser.add_argument(
+        "--stream",
+        default=DEFAULT_STREAM,
+        help=(
+            "Camera source. Defaults to the low-latency H.264 tunnel at "
+            "tcp://127.0.0.1:19001. Use "
+            "--stream http://127.0.0.1:19000/mjpg.jpg for frame mode."
+        ),
+    )
     parser.add_argument("--robot-api", default=DEFAULT_ROBOT_API)
     parser.add_argument("--vlm-model", default=DEFAULT_VLM_MODEL)
     parser.add_argument("--yolo-model", default=DEFAULT_YOLO_MODEL)
