@@ -586,6 +586,75 @@ def command_head(
         return False
 
 
+VOICE_COMMANDS = {
+    "select me": "select_me",
+    "arm head": "arm_head",
+    "track me": "arm_head",
+    "follow me": "follow_me",
+    "stop": "stop",
+    "halt": "stop",
+    "lie down": "lie_down",
+    "lay down": "lie_down",
+    "stop and lie down": "stop_and_lie_down",
+    "stop and lay down": "stop_and_lie_down",
+}
+VOICE_COMMAND_MAX_AGE_SECONDS = 5.0
+
+
+def voice_message_command(message: dict[str, object]) -> str | None:
+    """Return a canonical bounded command from one bridge inbox message."""
+    command = message.get("command")
+    if isinstance(command, str) and command in {
+        "select_me",
+        "arm_head",
+        "follow_me",
+        "stop",
+        "lie_down",
+        "stop_and_lie_down",
+    }:
+        return command
+    text = message.get("text")
+    if not isinstance(text, str):
+        return None
+    words = text.lower().strip().split()
+    if words and words[0] in {"nox", "knox", "knocks"}:
+        words = words[1:]
+    return VOICE_COMMANDS.get(" ".join(words))
+
+
+def fetch_voice_commands(
+    session: requests.Session,
+    robot_api: str,
+) -> list[tuple[str, dict[str, object]]]:
+    """Drain structured Pi voice messages without blocking the vision loop."""
+    response = session.get(
+        f"{robot_api.rstrip('/')}/voice/inbox",
+        timeout=(0.35, 0.75),
+    )
+    response.raise_for_status()
+    payload = response.json()
+    commands: list[tuple[str, dict[str, object]]] = []
+    received_at = time.time()
+    for message in payload.get("messages", []):
+        if not isinstance(message, dict):
+            continue
+        timestamp = message.get("ts")
+        if (
+            isinstance(timestamp, (int, float))
+            and received_at - float(timestamp) > VOICE_COMMAND_MAX_AGE_SECONDS
+        ):
+            print(
+                "Ignoring stale voice command "
+                f"({received_at - float(timestamp):.1f}s old): "
+                f"{message.get('text')!r}"
+            )
+            continue
+        command = voice_message_command(message)
+        if command is not None:
+            commands.append((command, message))
+    return commands
+
+
 def command_body_action(
     session: requests.Session,
     robot_api: str,
@@ -695,6 +764,19 @@ def prepare_body_for_following(
                 return False, f"invalid motion status: {status!r}"
             if status.get("legs_done") and not status.get("busy"):
                 time.sleep(0.5)
+                arm_response = session.post(
+                    f"{robot_api.rstrip('/')}/command",
+                    json={"cmd": "arm_motion"},
+                    timeout=4,
+                )
+                arm_response.raise_for_status()
+                arm_payload = arm_response.json()
+                if (
+                    not isinstance(arm_payload, dict)
+                    or arm_payload.get("ok") is not True
+                    or arm_payload.get("motion_armed") is not True
+                ):
+                    return False, f"Pi motion latch did not arm: {arm_payload!r}"
                 return True, None
             time.sleep(0.1)
         return False, "slow stand did not complete before timeout"
@@ -1119,6 +1201,17 @@ def parse_args() -> argparse.Namespace:
         default=2.0,
         help="Fresh-frame warm-up period before automatic head centring.",
     )
+    parser.add_argument(
+        "--voice-poll-interval",
+        type=float,
+        default=0.25,
+        help="Seconds between checks of the Pi voice-command inbox.",
+    )
+    parser.add_argument(
+        "--disable-voice-commands",
+        action="store_true",
+        help="Do not consume commands from the Pi voice service.",
+    )
     return parser.parse_args()
 
 
@@ -1156,6 +1249,8 @@ def main() -> None:
         raise ValueError(
             "--camera-warmup-seconds must be between 0.5 and 10 seconds"
         )
+    if not 0.1 <= args.voice_poll_interval <= 5.0:
+        raise ValueError("--voice-poll-interval must be between 0.1 and 5 seconds")
 
     yolo = YoloTracker(args.yolo_model, args.confidence, args.imgsz)
     pose = PoseEstimator(
@@ -1220,6 +1315,9 @@ def main() -> None:
     recognition_history: dict[int, deque[tuple[str | None, float]]] = {}
     identity_labels: dict[int, tuple[str, float]] = {}
     follow_log = FollowStateLogger()
+    voice_command_queue: deque[tuple[str, dict[str, object]]] = deque()
+    last_voice_poll_time = 0.0
+    last_voice_error_log_time = 0.0
 
     print(
         "1-9: select person | 0: clear | C: centre | M: head arm/disarm | "
@@ -1227,6 +1325,13 @@ def main() -> None:
         "A: fallback aim | H: head aim | V/Space: VLM | Y: YOLO on/off | "
         "Q/Esc: quit"
     )
+    if args.disable_voice_commands:
+        print("Pi voice-command polling disabled")
+    else:
+        print(
+            "Voice commands enabled: select me | arm head | follow me | "
+            "stop | lie down"
+        )
     try:
         deadline = time.monotonic() + 15
         while time.monotonic() < deadline:
@@ -2028,6 +2133,93 @@ def main() -> None:
 
             cv2.imshow("PiDog YOLO + Qwen VLM", display_frame)
             key = cv2.waitKey(1) & 0xFF
+
+            # Polling is deliberately lightweight and separate from camera
+            # transport.  Safety commands have already been executed locally
+            # by the Pi; consuming them here disarms the desktop controller so
+            # it cannot admit another gait.
+            voice_now = time.perf_counter()
+            if (
+                not args.disable_voice_commands
+                and voice_now - last_voice_poll_time >= args.voice_poll_interval
+            ):
+                last_voice_poll_time = voice_now
+                try:
+                    voice_command_queue.extend(
+                        fetch_voice_commands(robot_session, args.robot_api)
+                    )
+                except requests.RequestException as exc:
+                    if voice_now - last_voice_error_log_time >= 10.0:
+                        print(f"Voice inbox unavailable: {exc}")
+                        last_voice_error_log_time = voice_now
+
+            if voice_command_queue:
+                voice_command, voice_message = voice_command_queue.popleft()
+                confidence = voice_message.get("confidence")
+                print(
+                    f"VOICE COMMAND: {voice_command} "
+                    f"(heard={voice_message.get('text')!r}, "
+                    f"confidence={confidence})"
+                )
+                if voice_command in {
+                    "stop",
+                    "lie_down",
+                    "stop_and_lie_down",
+                }:
+                    movement_enabled = False
+                    turning_enabled = False
+                    body_safety_stopped = False
+                    key = 255
+                    local_status = (
+                        "confirmed by Pi"
+                        if voice_message.get("local_ok")
+                        else "Pi acknowledgement missing"
+                    )
+                    print(
+                        f"Voice {voice_command}: head/body following DISARMED; "
+                        f"local posture action {local_status}"
+                    )
+                elif key == 255 and voice_command == "select_me":
+                    people = selectable_people(yolo_state.detections)
+                    recognised_slots = [
+                        slot
+                        for slot, person in enumerate(people[:9])
+                        if person.track_id in identity_labels
+                    ]
+                    if len(recognised_slots) == 1:
+                        slot = recognised_slots[0]
+                        identity = identity_labels[people[slot].track_id][0]
+                        print(
+                            f"Voice select me resolved uniquely to {identity} "
+                            f"in person slot {slot + 1}"
+                        )
+                        key = ord("1") + slot
+                    elif not recognised_slots:
+                        print(
+                            "Voice select me rejected: no uniquely recognised "
+                            "visible identity"
+                        )
+                    else:
+                        identities = [
+                            identity_labels[people[slot].track_id][0]
+                            for slot in recognised_slots
+                        ]
+                        print(
+                            "Voice select me rejected: multiple recognised "
+                            f"people are visible ({', '.join(identities)}); "
+                            "speaker verification is not enabled yet"
+                        )
+                elif key == 255 and voice_command == "arm_head":
+                    if movement_enabled:
+                        print("Voice arm head: head tracking is already armed")
+                    else:
+                        key = ord("m")
+                elif key == 255 and voice_command == "follow_me":
+                    if turning_enabled:
+                        print("Voice follow me: body following is already armed")
+                    else:
+                        key = ord("t")
+
             if key in (ord("q"), 27):
                 break
             if key == ord("y"):

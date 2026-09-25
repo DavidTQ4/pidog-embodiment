@@ -165,6 +165,17 @@ class PerceptionState:
 perception = PerceptionState()
 
 
+def set_tts_echo_window(text):
+    """Suppress microphone recognition while PiDog is speaking."""
+    # Piper's exact duration varies by voice and hardware.  A conservative
+    # character estimate plus tail buffer is preferable to PiDog hearing its
+    # own final word as a fresh command.
+    until = time.time() + max(1.5, len(text) * 0.08 + 1.0)
+    with perception.lock:
+        perception.tts_echo_until = max(perception.tts_echo_until, until)
+    return until
+
+
 # ─── Face Database ───
 class FaceDB:
     """Simple face database using stored reference images.
@@ -722,8 +733,11 @@ class BridgeHandler(BaseHTTPRequestHandler):
             text = body.get("text", "")
             blocking = body.get("blocking", False)
             if text:
+                echo_until = set_tts_echo_window(text)
                 if blocking:
                     r = send_to_daemon({"cmd": "speak", "text": text})
+                    if isinstance(r, dict):
+                        r["echo_until"] = echo_until
                     self._send_json(r)
                 else:
                     # Fire-and-forget in thread
@@ -733,7 +747,12 @@ class BridgeHandler(BaseHTTPRequestHandler):
                         daemon=True
                     )
                     t.start()
-                    self._send_json({"ok": True, "spoke": text, "async": True})
+                    self._send_json({
+                        "ok": True,
+                        "spoke": text,
+                        "async": True,
+                        "echo_until": echo_until,
+                    })
             else:
                 self._send_json({"error": "no text"}, 400)
         
@@ -804,6 +823,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
             # Brain sends response to voice query
             text = body.get("text", "")
             if text:
+                echo_until = set_tts_echo_window(text)
                 with perception.lock:
                     perception.voice_outbox.append({
                         "text": text,
@@ -811,7 +831,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
                     })
                 # Speak it
                 send_to_daemon({"cmd": "speak", "text": text})
-                self._send_json({"ok": True})
+                self._send_json({"ok": True, "echo_until": echo_until})
             else:
                 self._send_json({"error": "no text"}, 400)
         
@@ -822,8 +842,19 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 msg = {
                     "text": text,
                     "ts": time.time(),
-                    "source": "voice"
+                    "source": body.get("source", "voice"),
                 }
+                # Preserve bounded, structured command metadata for the
+                # desktop tracker.  Unknown fields are intentionally ignored.
+                for key in (
+                    "command",
+                    "confidence",
+                    "speaker",
+                    "local_action",
+                    "local_ok",
+                ):
+                    if key in body:
+                        msg[key] = body[key]
                 # Push to brain immediately (non-blocking)
                 threading.Thread(
                     target=push_to_brain,
@@ -833,7 +864,10 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 # Also store in inbox as fallback
                 with perception.lock:
                     perception.voice_inbox.append(msg)
-                self._send_json({"ok": True})
+                    # Avoid an unbounded queue if the desktop is offline.
+                    if len(perception.voice_inbox) > 100:
+                        del perception.voice_inbox[:-100]
+                self._send_json({"ok": True, "message": msg})
             else:
                 self._send_json({"error": "no text"}, 400)
         
@@ -871,8 +905,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 t.start()
                 # Smart echo suppression: estimate when TTS will finish
                 # Piper TTS: ~80ms/char for German + 1s buffer
-                est_tts_end = time.time() + len(speak_text) * 0.08 + 1.5
-                perception.tts_echo_until = est_tts_end
+                est_tts_end = set_tts_echo_window(speak_text)
                 results.append({"ok": True, "spoke": speak_text, "async": True, "echo_until": est_tts_end})
             
             self._send_json({"ok": True, "results": results})

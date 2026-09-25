@@ -119,6 +119,7 @@ dog_lock = threading.Lock()
 # buffers, but do_action() does not reject work while those buffers are busy.
 motion_admission_lock = threading.RLock()
 current_leg_action = None
+motion_halt_latched = False
 running = True
 
 # ─── Servo Idle Management ───
@@ -511,6 +512,7 @@ def cmd_motion_status():
                 and "legs_thread" not in state["threads_dead"]
             ),
             "current_action": current_leg_action,
+            "halt_latched": motion_halt_latched,
         })
         return state
 
@@ -526,6 +528,16 @@ def _remember_leg_action(action, result):
 
 def cmd_move(action, steps=3, speed=80, internal=False):
     """Legacy movement entry point, serialised but allowed to queue."""
+    if motion_halt_latched and action in {
+        "forward", "backward", "turn_left", "turn_right", "trot"
+    }:
+        return {
+            "ok": True,
+            "accepted": False,
+            "halt_latched": True,
+            "action": action,
+            "reason": "locomotion is latched off; arm_motion is required",
+        }
     with motion_admission_lock:
         result = _cmd_move(action, steps, speed, internal)
         _remember_leg_action(action, result)
@@ -568,6 +580,17 @@ def cmd_move_if_idle(
             "note": "another movement request is being admitted",
         }
     try:
+        if motion_halt_latched and action in {
+            "forward", "backward", "turn_left", "turn_right", "trot"
+        }:
+            return {
+                "ok": True,
+                "accepted": False,
+                "busy": False,
+                "halt_latched": True,
+                "action": action,
+                "reason": "locomotion is latched off; arm_motion is required",
+            }
         with dog_lock:
             state = _legs_motion_state_locked()
         if "legs_thread" in state["threads_dead"]:
@@ -1182,25 +1205,96 @@ def cmd_scan_sweep(angles=None, settle_ms=200, samples=3):
     return {"ok": True, "scan": result, "timestamp": time.time()}
 
 
+def _clear_action_buffers(names):
+    """Clear queued SDK frames and return the number discarded."""
+    cleared_frames = 0
+    for name in names:
+        buffer = getattr(dog, name, None)
+        if buffer is not None and hasattr(buffer, "clear"):
+            cleared_frames += len(buffer)
+            buffer.clear()
+    return cleared_frames
+
+
+def cmd_halt(speed=40):
+    """Stop queued locomotion and settle into a stable standing posture.
+
+    Head and tail buffers are deliberately left alone so visual tracking can
+    continue after a spoken stop.  This is an urgent local command and does not
+    wait for the desktop controller or network tunnel.
+    """
+    global current_leg_action, _idle_state, motion_halt_latched
+    speed = max(20, min(60, int(speed)))
+    print(f"[nox] HALT requested; stabilising at speed {speed}", flush=True)
+    motion_halt_latched = True
+    with motion_admission_lock:
+        with dog_lock:
+            cleared_frames = _clear_action_buffers(("legs_action_buffer",))
+            try:
+                dog.do_action("stand", speed=speed)
+                current_leg_action = "stand"
+            except Exception as exc:
+                return {
+                    "ok": False,
+                    "halted": False,
+                    "error": f"failed to queue stable stand: {exc}",
+                    "cleared_motion_frames": cleared_frames,
+                }
+    _mark_activity()
+    return {
+        "ok": True,
+        "halted": True,
+        "posture": "stand",
+        "speed": speed,
+        "cleared_motion_frames": cleared_frames,
+    }
+
+
+def cmd_lie_down(speed=40):
+    """Discard queued locomotion and enter a controlled lying posture."""
+    global current_leg_action, _idle_state, motion_halt_latched
+    speed = max(20, min(60, int(speed)))
+    print(f"[nox] LIE DOWN requested at speed {speed}", flush=True)
+    motion_halt_latched = True
+    with motion_admission_lock:
+        with dog_lock:
+            cleared_frames = _clear_action_buffers(("legs_action_buffer",))
+            try:
+                dog.do_action("lie", speed=speed)
+                current_leg_action = "lie"
+            except Exception as exc:
+                return {
+                    "ok": False,
+                    "lying_down": False,
+                    "error": f"failed to queue lie posture: {exc}",
+                    "cleared_motion_frames": cleared_frames,
+                }
+    _idle_state = "resting"
+    return {
+        "ok": True,
+        "lying_down": True,
+        "posture": "lie",
+        "speed": speed,
+        "cleared_motion_frames": cleared_frames,
+    }
+
+
 def cmd_emergency_stop():
     """Emergency stop: immediately cease all movement and lie down.
     Adapted from HoundMind SafetyModule pattern."""
-    global _idle_state, _servo_pwm_disabled, current_leg_action
+    global _idle_state, _servo_pwm_disabled, current_leg_action, motion_halt_latched
     print("[nox] EMERGENCY STOP triggered!", flush=True)
+    motion_halt_latched = True
     cleared_frames = 0
     with dog_lock:
         # Clear pending SDK frames before adding the single safe posture.  This
         # cannot undo a servo frame already executing, but it prevents the
         # remaining backlog from running first.
-        for name in (
+        cleared_frames = _clear_action_buffers((
             "legs_action_buffer",
             "head_action_buffer",
             "tail_action_buffer",
-        ):
-            buffer = getattr(dog, name, None)
-            if buffer is not None and hasattr(buffer, "clear"):
-                cleared_frames += len(buffer)
-                buffer.clear()
+        ))
         try:
             dog.do_action("lie", speed=100)
             current_leg_action = "lie"
@@ -1216,6 +1310,15 @@ def cmd_emergency_stop():
         "emergency": True,
         "cleared_motion_frames": cleared_frames,
     }
+
+
+def cmd_arm_motion():
+    """Explicitly clear the local halt latch before identity following."""
+    global motion_halt_latched
+    motion_halt_latched = False
+    _mark_activity()
+    print("[nox] Locomotion halt latch ARMED/OFF", flush=True)
+    return {"ok": True, "motion_armed": True, "halt_latched": False}
 
 
 def cmd_three_way_scan():
@@ -1293,6 +1396,9 @@ COMMANDS = {
     "scan": lambda args: cmd_scan(),
     "scan_sweep": lambda args: cmd_scan_sweep(args.get("angles"), args.get("settle_ms", 200), args.get("samples", 3)),
     "three_way_scan": lambda args: cmd_three_way_scan(),
+    "halt": lambda args: cmd_halt(args.get("speed", 40)),
+    "lie_down": lambda args: cmd_lie_down(args.get("speed", 40)),
+    "arm_motion": lambda args: cmd_arm_motion(),
     "emergency_stop": lambda args: cmd_emergency_stop(),
 }
 

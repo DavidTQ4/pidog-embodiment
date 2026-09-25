@@ -1,0 +1,20 @@
+[Unit]
+Description=Nox Offline Voice Command Service
+Wants=network-online.target nox-body.service nox-bridge.service
+After=network-online.target sound.target nox-body.service nox-bridge.service
+
+[Service]
+Type=simple
+User=david
+Group=david
+SupplementaryGroups=audio
+WorkingDirectory=/home/david/pidog-embodiment/body
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=-/home/david/pidog-embodiment/body/nox-voice.env
+ExecStart=/home/david/pidog-embodiment/.voice-venv/bin/python -u /home/david/pidog-embodiment/body/nox_voice.py
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=5
+
+[Install]
+WantedBy=multi-user.target
