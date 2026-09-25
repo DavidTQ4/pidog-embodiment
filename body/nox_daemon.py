@@ -56,11 +56,14 @@ SOUNDS_DIR = os.path.expanduser("~/pidog/sounds")
 # ─── Ultrasonic distance sensor (separate from PiDog to avoid Process hang) ───
 ultrasonic = None
 ultrasonic_distance = -1.0
+ultrasonic_sample_at = 0.0
 ultrasonic_lock = threading.Lock()
+ULTRASONIC_MAX_AGE_SECONDS = 0.75
+HEAD_TRACKING_SPEED = 98
 
 def _ultrasonic_bg_thread():
     """Background thread to continuously read ultrasonic distance."""
-    global ultrasonic, ultrasonic_distance
+    global ultrasonic, ultrasonic_distance, ultrasonic_sample_at
     from robot_hat import Pin as RHPin
     from robot_hat.modules import Ultrasonic as US
     import time as t2
@@ -74,6 +77,7 @@ def _ultrasonic_bg_thread():
                 d = us.read(times=3)
                 with ultrasonic_lock:
                     ultrasonic_distance = d if d > 0 else -1.0
+                    ultrasonic_sample_at = time.monotonic()
             except:
                 pass
             t2.sleep(0.1)  # 10Hz reading
@@ -106,14 +110,15 @@ except Exception:
 # I2C reachability diagnostics (issue #12) — stdlib only, ships next to us.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from nox_i2c_diag import mcu_diag  # noqa: E402
-from nox_motion import buffer_depth as _buffer_depth  # noqa: E402
-from nox_motion import drain as _drain_motion  # noqa: E402
-from nox_audio import ensure_music  # noqa: E402
 
 # ─── Global state ───
 dog = None
 camera_lock = threading.Lock()
 dog_lock = threading.Lock()
+# Serialises the decision to admit a leg action.  The SDK has its own motion
+# buffers, but do_action() does not reject work while those buffers are busy.
+motion_admission_lock = threading.RLock()
+current_leg_action = None
 running = True
 
 # ─── Servo Idle Management ───
@@ -229,18 +234,10 @@ def init_dog():
     dog.rgb_strip.set_mode('breath', [0, 0, 0] if _is_sleep_hours() else [128, 0, 255], bps=0.8)
     # Health check: report what's working
     _hw_status = []
-    # The SDK leaves .music unset when "sound_effect init ... fail" (issue #24).
-    # bark/howling/pant call dog.speak() mid-sequence, so without a stand-in the
-    # whole action dies with AttributeError — not just its sound.
-    _audio = ensure_music(dog, device=_PLAYBACK_DEVICE)
-    if _audio["attached"]:
-        print(f"[nox] Audio: SDK sound engine missing, using {_audio['reason']}", flush=True)
-        _hw_status.append("audio:aplay-shim")
-    elif getattr(dog, "music", None) is not None:
+    if hasattr(dog, 'music') and dog.music is not None:
         _hw_status.append("audio:pygame")
     else:
-        print(f"[nox] WARNING: no audio at all — {_audio['reason']}", flush=True)
-        _hw_status.append("audio:none")
+        _hw_status.append("audio:aplay-fallback")
     if hasattr(dog, 'pitch'):
         _hw_status.append("imu:ok")
     else:
@@ -380,26 +377,32 @@ def cmd_status():
         # battery with a failing ADC read looks identical otherwise (issue #12).
         info["battery_v"] = "error"
         info["battery_error"] = f"{type(e).__name__}: {e}"
+    try:
+        info["motion"] = cmd_motion_status()
+    except Exception as e:
+        info["motion"] = {
+            "ok": False,
+            "busy": True,
+            "error": f"{type(e).__name__}: {e}",
+        }
     return info
 
 
-def cmd_move(action, steps=3, speed=80, internal=False):
-    """Execute a movement action."""
+def _cmd_move(action, steps=3, speed=80, internal=False):
+    """Queue a movement action and acknowledge without waiting for execution."""
     _mark_activity(internal=internal)
     if _idle_state == "sleeping":
         # Re-init servos before moving
         pass  # PiDog re-enables on do_action
-    with dog_lock:
-        # SDK do_action() swallows unknown actions (prints and returns), so we
-        # must route ourselves. Probe the CLASS for a property: instance
-        # hasattr would execute the ActionDict property just to probe it.
-        if isinstance(getattr(type(dog.actions_dict), action, None), property):
-            dog.do_action(action, step_count=int(steps), speed=int(speed))
-            time.sleep(1.5)
-            # The SDK's consumer threads die permanently on their first
-            # exception (`except Exception: break`) — after that every action
-            # queues forever while do_action still "succeeds" (issue #12:
-            # ok:true but the dog never moves). Detect that here.
+
+    # SDK do_action() swallows unknown actions (prints and returns), so we
+    # must route ourselves. Probe the CLASS for a property: instance hasattr
+    # would execute the ActionDict property just to probe it.
+    if isinstance(getattr(type(dog.actions_dict), action, None), property):
+        with dog_lock:
+            # Validate the consumers and controller before adding frames. The
+            # old implementation slept for 1.5 seconds while holding this
+            # lock, which prevented head counter-steering during a leg turn.
             dead = _dead_action_threads()
             if dead:
                 return {"ok": False, "action": action,
@@ -407,25 +410,36 @@ def cmd_move(action, steps=3, speed=80, internal=False):
                                  "commands queue but are never executed",
                         "hint": "sudo systemctl restart nox-body; then check: "
                                 "journalctl -u nox-body | grep -i exception"}
-            queued = _action_buffer_depth()
-            result = {"ok": True, "action": action}
-            if queued > 0:
-                result["note"] = f"{queued} motion frames still queued (long action or slow servos)"
             i2c = i2c_status()
             if not i2c.get("responding", True):
-                # robot_hat returned False for every write and raised nothing:
-                # the servo controller never received this command (issue #12).
                 return {"ok": False, "action": action,
                         "error": f"servo controller unreachable — {i2c.get('error')}",
                         "hint": i2c.get("hint"), "i2c": i2c}
-            if _servo_power_missing():
-                result["warning"] = (
-                    "battery rail reads 0.0 V - the servos have no power, so this "
-                    "action ran in software only and the dog did not move")
-                result["hint"] = ("check the battery: pack plugged in and the PiDog "
-                                  "power switch ON. The Pi keeps running from USB-C, "
-                                  "which is why everything else looks healthy")
-            return result
+            servo_power_missing = _servo_power_missing()
+            dog.do_action(action, step_count=int(steps), speed=int(speed))
+            queued = _action_buffer_depth()
+
+        # The hardware lock is deliberately released immediately after the
+        # SDK accepts the frames. Head commands can now be queued while the
+        # independent leg consumer executes the gait. Completion remains
+        # authoritative through is_legs_done() plus the leg-buffer check.
+        result = {
+            "ok": True,
+            "action": action,
+            "execution": "queued",
+            "non_blocking": True,
+            "queued_motion_frames": queued,
+        }
+        if servo_power_missing:
+            result["warning"] = (
+                "battery rail reads 0.0 V - the servos have no power, so this "
+                "action was queued in software only and the dog will not move")
+            result["hint"] = ("check the battery: pack plugged in and the PiDog "
+                              "power switch ON. The Pi keeps running from USB-C, "
+                              "which is why everything else looks healthy")
+        return result
+
+    with dog_lock:
         # pant/bark/howling & friends live in pidog.preset_actions, not in
         # ActionDict (issue #12: 'ActionDict' object has no attribute 'pant').
         preset = getattr(_preset_actions, action, None) if _preset_actions else None
@@ -433,20 +447,6 @@ def cmd_move(action, steps=3, speed=80, internal=False):
             try:
                 preset(dog)
                 return {"ok": True, "action": action, "via": "preset"}
-            except AttributeError as e:
-                if "music" in str(e):
-                    # Should not happen since init attaches a fallback, but a
-                    # bare AttributeError here sent issue #24 hunting in the
-                    # wrong place — so say what it means.
-                    return {"ok": False, "action": action,
-                            "error": f"action '{action}' plays a sound, and this "
-                                     "robot's SDK sound engine failed to start "
-                                     "(sound_effect init ... fail)",
-                            "hint": "restart nox-body: the daemon attaches an "
-                                    "aplay fallback at startup. If it persists, "
-                                    "check: aplay -l  and the AUDIODEV setting"}
-                return {"ok": False, "action": action,
-                        "error": f"preset action failed: {type(e).__name__}: {e}"}
             except Exception as e:
                 return {"ok": False, "action": action,
                         "error": f"preset action failed: {type(e).__name__}: {e}"}
@@ -467,7 +467,190 @@ def _dead_action_threads():
 
 def _action_buffer_depth():
     """Total motion frames waiting in the SDK's action buffers."""
-    return _buffer_depth(dog)
+    total = 0
+    for name in ("legs_action_buffer", "head_action_buffer", "tail_action_buffer"):
+        buf = getattr(dog, name, None)
+        if buf is not None:
+            total += len(buf)
+    return total
+
+
+def _legs_motion_state_locked():
+    """Inspect leg completion while dog_lock is held by the caller."""
+    try:
+        legs_done = bool(dog.is_legs_done())
+        state_error = None
+    except Exception as e:
+        # Unknown must be treated as busy; accepting a command would recreate
+        # the unbounded queue failure this interface is intended to prevent.
+        legs_done = False
+        state_error = f"{type(e).__name__}: {e}"
+    buffer = getattr(dog, "legs_action_buffer", None)
+    buffered_frames = len(buffer) if buffer is not None else 0
+    dead = _dead_action_threads()
+    return {
+        "legs_done": legs_done,
+        "busy": (not legs_done) or buffered_frames > 0,
+        "buffered_leg_frames": buffered_frames,
+        "threads_dead": dead,
+        "state_error": state_error,
+    }
+
+
+def cmd_motion_status():
+    """Return authoritative SDK leg state without adding an action."""
+    global current_leg_action
+    with motion_admission_lock:
+        with dog_lock:
+            state = _legs_motion_state_locked()
+        if not state["busy"]:
+            current_leg_action = None
+        state.update({
+            "ok": (
+                state["state_error"] is None
+                and "legs_thread" not in state["threads_dead"]
+            ),
+            "current_action": current_leg_action,
+        })
+        return state
+
+
+def _remember_leg_action(action, result):
+    global current_leg_action
+    if result.get("ok") and isinstance(
+        getattr(type(dog.actions_dict), action, None),
+        property,
+    ):
+        current_leg_action = action
+
+
+def cmd_move(action, steps=3, speed=80, internal=False):
+    """Legacy movement entry point, serialised but allowed to queue."""
+    with motion_admission_lock:
+        result = _cmd_move(action, steps, speed, internal)
+        _remember_leg_action(action, result)
+        return result
+
+
+def _ultrasonic_state():
+    """Return one coherent distance sample for motion-safety decisions."""
+    with ultrasonic_lock:
+        distance = ultrasonic_distance
+        sample_at = ultrasonic_sample_at
+    age = time.monotonic() - sample_at if sample_at > 0 else None
+    valid = distance > 0 and age is not None and age <= ULTRASONIC_MAX_AGE_SECONDS
+    return {
+        "distance_cm": round(distance, 1) if distance > 0 else None,
+        "distance_valid": valid,
+        "distance_age_s": round(age, 3) if age is not None else None,
+    }
+
+
+def cmd_move_if_idle(
+    action,
+    steps=3,
+    speed=80,
+    internal=False,
+    min_distance_cm=None,
+):
+    """Atomically require idle legs and, when requested, safe clearance."""
+    # Do not let concurrent HTTP requests become a second queue while another
+    # action is being admitted.  A caller can retry after receiving busy:true.
+    if not motion_admission_lock.acquire(blocking=False):
+        return {
+            "ok": True,
+            "accepted": False,
+            "busy": True,
+            "legs_done": False,
+            "buffered_leg_frames": None,
+            "current_action": current_leg_action,
+            "action": action,
+            "note": "another movement request is being admitted",
+        }
+    try:
+        with dog_lock:
+            state = _legs_motion_state_locked()
+        if "legs_thread" in state["threads_dead"]:
+            return {
+                **state,
+                "ok": False,
+                "accepted": False,
+                "busy": True,
+                "action": action,
+                "error": "leg action thread is not healthy",
+            }
+        if state["state_error"] is not None:
+            return {
+                **state,
+                "ok": False,
+                "accepted": False,
+                "busy": True,
+                "action": action,
+                "error": f"cannot determine leg state: {state['state_error']}",
+            }
+        if state["busy"]:
+            return {
+                **state,
+                "ok": True,
+                "accepted": False,
+                "action": action,
+            }
+
+        if min_distance_cm is not None:
+            try:
+                minimum = float(min_distance_cm)
+            except (TypeError, ValueError):
+                return {
+                    **state,
+                    "ok": False,
+                    "accepted": False,
+                    "action": action,
+                    "error": "min_distance_cm must be a number",
+                }
+            if not 5.0 <= minimum <= 400.0:
+                return {
+                    **state,
+                    "ok": False,
+                    "accepted": False,
+                    "action": action,
+                    "error": "min_distance_cm must be between 5 and 400",
+                }
+            clearance = _ultrasonic_state()
+            if not clearance["distance_valid"]:
+                return {
+                    **state,
+                    **clearance,
+                    "ok": True,
+                    "accepted": False,
+                    "safety_stop": True,
+                    "action": action,
+                    "min_distance_cm": minimum,
+                    "reason": "ultrasonic reading is missing or stale",
+                }
+            if clearance["distance_cm"] <= minimum:
+                return {
+                    **state,
+                    **clearance,
+                    "ok": True,
+                    "accepted": False,
+                    "safety_stop": True,
+                    "action": action,
+                    "min_distance_cm": minimum,
+                    "reason": "obstruction inside safety clearance",
+                }
+
+        result = _cmd_move(action, steps, speed, internal)
+        _remember_leg_action(action, result)
+        result["accepted"] = bool(result.get("ok"))
+        with dog_lock:
+            result.update(_legs_motion_state_locked())
+        result["current_action"] = current_leg_action
+        if min_distance_cm is not None:
+            result.update(_ultrasonic_state())
+            result["min_distance_cm"] = float(min_distance_cm)
+        return result
+    finally:
+        motion_admission_lock.release()
 
 
 def cmd_servo_test():
@@ -564,7 +747,11 @@ def cmd_head(yaw=0, roll=0, pitch=0, smooth=True, internal=False):
     if not smooth:
         # Direct move (for resets/wake)
         with dog_lock:
-            dog.head_move([[yaw, roll, pitch]], immediately=True, speed=80)
+            dog.head_move(
+                [[yaw, roll, pitch]],
+                immediately=True,
+                speed=HEAD_TRACKING_SPEED,
+            )
             time.sleep(0.3)
         _smooth_head.snap_to(yaw, roll, pitch)
         return {"ok": True, "head": [yaw, roll, pitch]}
@@ -578,7 +765,11 @@ def cmd_head(yaw=0, roll=0, pitch=0, smooth=True, internal=False):
         for s in range(1, steps + 1):
             t = _ease_in_out_cubic(s / steps)
             pos = [start[i] + (target[i] - start[i]) * t for i in range(3)]
-            dog.head_move([pos], immediately=True, speed=80)
+            dog.head_move(
+                [pos],
+                immediately=True,
+                speed=HEAD_TRACKING_SPEED,
+            )
             time.sleep(step_delay)
     _smooth_head.snap_to(yaw, roll, pitch)
     return {"ok": True, "head": [yaw, roll, pitch]}
@@ -595,7 +786,11 @@ def cmd_head_ema(yaw=0, roll=0, pitch=0, internal=False):
         return {"ok": True, "skipped": "deadband"}
     pos = _smooth_head.ema_step()
     with dog_lock:
-        dog.head_move([pos], immediately=True, speed=80)
+        dog.head_move(
+            [pos],
+            immediately=True,
+            speed=HEAD_TRACKING_SPEED,
+        )
     return {"ok": True, "head": pos}
 
 _VALID_RGB_STYLES = {"monochromatic", "breath", "boom", "bark", "speak", "listen"}
@@ -629,8 +824,12 @@ def _ensure_camera():
             from vilib import Vilib
             Vilib.camera_start(vflip=False, hflip=False)
             time.sleep(2)
+            
+            # start ViLibs continous MJPEG stream
+            Vilib.display(local=False, web=True)
+            
             _camera_ready = True
-            print("[nox] Camera initialized (persistent mode)", flush=True)
+            print("[nox] Camera initialized with MJPEG stream on port 9000", flush=True)
             return True
         except Exception as e:
             print(f"[nox] Camera init failed: {e}", flush=True)
@@ -788,6 +987,12 @@ def cmd_wake():
     return {"ok": True}
 
 
+def cmd_keep_awake():
+    """Renew the controller activity lease without moving any servos."""
+    _mark_activity()
+    return {"ok": True, "idle_state": _idle_state}
+
+
 def cmd_sleep():
     """Sleep sequence."""
     with dog_lock:
@@ -852,9 +1057,7 @@ def cmd_sensors():
         result["sound_error"] = str(e)
     
     # Ultrasonic (from background thread)
-    with ultrasonic_lock:
-        dist = ultrasonic_distance
-    result["distance_cm"] = round(dist, 1) if dist > 0 else None
+    result.update(_ultrasonic_state())
     
     # System
     import shutil
@@ -982,17 +1185,25 @@ def cmd_scan_sweep(angles=None, settle_ms=200, samples=3):
 def cmd_emergency_stop():
     """Emergency stop: immediately cease all movement and lie down.
     Adapted from HoundMind SafetyModule pattern."""
-    global _idle_state, _servo_pwm_disabled
+    global _idle_state, _servo_pwm_disabled, current_leg_action
     print("[nox] EMERGENCY STOP triggered!", flush=True)
+    cleared_frames = 0
     with dog_lock:
-        # Clear the queue FIRST: do_action only appends, so without this the
-        # `lie` below waits behind every frame still pending (issue #25).
-        drained = _drain_motion(dog)
-        if drained["drained"]:
-            print(f"[nox] Dropped {drained['drained']} queued motion frames "
-                  f"(via {drained['via']})", flush=True)
+        # Clear pending SDK frames before adding the single safe posture.  This
+        # cannot undo a servo frame already executing, but it prevents the
+        # remaining backlog from running first.
+        for name in (
+            "legs_action_buffer",
+            "head_action_buffer",
+            "tail_action_buffer",
+        ):
+            buffer = getattr(dog, name, None)
+            if buffer is not None and hasattr(buffer, "clear"):
+                cleared_frames += len(buffer)
+                buffer.clear()
         try:
             dog.do_action("lie", speed=100)
+            current_leg_action = "lie"
         except Exception:
             pass
         try:
@@ -1000,22 +1211,11 @@ def cmd_emergency_stop():
         except Exception:
             pass
     _idle_state = "resting"
-    return {"ok": True, "emergency": True, "motion": drained}
-
-
-def cmd_stop_motion():
-    """Drop every queued motion frame immediately (issue #25).
-
-    Stopping the behaviour engine only stops new frames from being queued; the
-    ones already buffered keep the dog moving for many seconds afterwards.
-    """
-    with dog_lock:
-        result = _drain_motion(dog)
-    if result["drained"]:
-        print(f"[nox] Motion stop: dropped {result['drained']} queued frames "
-              f"(via {result['via']})", flush=True)
-    result["ok"] = not result.get("error")
-    return result
+    return {
+        "ok": True,
+        "emergency": True,
+        "cleared_motion_frames": cleared_frames,
+    }
 
 
 def cmd_three_way_scan():
@@ -1071,6 +1271,8 @@ COMMANDS = {
     "status": lambda args: cmd_status(),
     "servo_test": lambda args: cmd_servo_test(),
     "move": lambda args: cmd_move(args.get("action", "stand"), args.get("steps", 3), args.get("speed", 80), internal=args.get("_internal", False)),
+    "move_if_idle": lambda args: cmd_move_if_idle(args.get("action", "stand"), args.get("steps", 3), args.get("speed", 80), internal=args.get("_internal", False), min_distance_cm=args.get("min_distance_cm")),
+    "motion_status": lambda args: cmd_motion_status(),
     "head": lambda args: cmd_head(args.get("yaw", 0), args.get("roll", 0), args.get("pitch", 0), args.get("smooth", True), internal=args.get("_internal", False)),
     "head_ema": lambda args: cmd_head_ema(args.get("yaw", 0), args.get("roll", 0), args.get("pitch", 0), internal=args.get("_internal", False)),
     "rgb": lambda args: cmd_rgb(args.get("r", 128), args.get("g", 0), args.get("b", 255), args.get("mode", "breath"), args.get("bps", 0.8)),
@@ -1079,6 +1281,7 @@ COMMANDS = {
     "sound": lambda args: cmd_sound(args.get("name", "single_bark_1")),
     "combo": lambda args: cmd_combo(args.get("sequence", "stand:1:60")),
     "wake": lambda args: cmd_wake(),
+    "keep_awake": lambda args: cmd_keep_awake(),
     "sleep": lambda args: cmd_sleep(),
     "reset": lambda args: cmd_reset(),
     "ping": lambda args: {"pong": True, "ts": time.time()},
@@ -1091,7 +1294,6 @@ COMMANDS = {
     "scan_sweep": lambda args: cmd_scan_sweep(args.get("angles"), args.get("settle_ms", 200), args.get("samples", 3)),
     "three_way_scan": lambda args: cmd_three_way_scan(),
     "emergency_stop": lambda args: cmd_emergency_stop(),
-    "stop_motion": lambda args: cmd_stop_motion(),
 }
 
 
@@ -1190,7 +1392,7 @@ def tcp_server(port=9999):
     """TCP server for remote commands from Nox's Pi."""
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server.bind(('0.0.0.0', port))
+    server.bind(('127.0.0.1', port))
     server.listen(5)
     server.settimeout(1.0)
     print(f"[nox] TCP server listening on port {port}", flush=True)

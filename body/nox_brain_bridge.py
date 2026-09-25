@@ -39,7 +39,7 @@ from socketserver import ThreadingMixIn
 from pathlib import Path
 
 # ─── Configuration ───
-LISTEN_HOST = "0.0.0.0"
+LISTEN_HOST = "127.0.0.1"
 LISTEN_PORT = 8888
 DAEMON_HOST = "localhost"
 DAEMON_PORT = 9999
@@ -402,6 +402,25 @@ class BridgeHandler(BaseHTTPRequestHandler):
         elif path == "/perception":
             # Current perception state
             self._send_json(perception.snapshot())
+            
+        elif path == "/frame.jpg":
+            result = send_to_daemon({"cmd": "photo"}, timeout=15)
+
+            if not result.get("ok"):
+                self._send_json(result, 503)
+                return
+
+            try:
+                image_data = Path(result["photo"]).read_bytes()
+
+                self.send_response(200)
+                self.send_header("Content-Type", "image/jpeg")
+                self.send_header("Content-Length", str(len(image_data)))
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(image_data)
+            except Exception as exc:
+                self._send_json({"ok": False, "error": str(exc)}, 500)
         
         elif path == "/photo":
             # Take a photo and return it
@@ -413,7 +432,8 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 last_photo_b64=result.get("photo_b64"),
             )
             self._send_json(result)
-        
+ 
+               
         elif path == "/look":
             # Take photo with full analysis — returns everything
             # Capture
@@ -507,6 +527,8 @@ class BridgeHandler(BaseHTTPRequestHandler):
                     },
                     "distance": {
                         "forward_cm": raw.get("distance_cm"),
+                        "valid": raw.get("distance_valid", False),
+                        "age_s": raw.get("distance_age_s"),
                     },
                     "touch": {
                         "active": raw.get("touch", "N") != "N",
@@ -559,6 +581,13 @@ class BridgeHandler(BaseHTTPRequestHandler):
                     result["vision"] = {"age_s": None, "error": "not running"}
                 self._send_json(result)
 
+        elif path == "/motion/status":
+            result = send_to_daemon({"cmd": "motion_status"})
+            if result.get("error"):
+                self._send_json(result, 503)
+            else:
+                self._send_json(result)
+
         elif path == "/vision":
             # Vision engine results (Sprint 5)
             try:
@@ -581,11 +610,13 @@ class BridgeHandler(BaseHTTPRequestHandler):
                     "GET": ["/status", "/perception", "/photo", "/look", "/faces",
                             "/voice/inbox", "/voice/echo_until", "/memory/recent",
                             "/memory/stats", "/state", "/scan", "/scan/sweep",
-                            "/sensors", "/capabilities", "/vision", "/selftest"],
+                            "/sensors", "/motion/status", "/capabilities",
+                            "/vision", "/selftest"],
                     "POST": ["/action", "/speak", "/command", "/rgb", "/head",
                              "/face/register", "/voice/respond", "/voice/input",
                              "/combo", "/behavior/start", "/behavior/stop",
-                             "/emergency_stop", "/move", "/expression", "/look_at"],
+                             "/emergency_stop", "/keep_awake", "/move",
+                             "/expression", "/look_at"],
                 },
                 "actions": VALID_ACTIONS,
                 "expressions": list(EXPRESSION_MAP.keys()),
@@ -628,17 +659,63 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 return
             if isinstance(actions, str):
                 actions = [actions]
+            require_idle = bool(body.get("require_idle", False))
             results = []
             for action in actions:
                 if isinstance(action, str):
-                    r = send_to_daemon({"cmd": "move", "action": action})
+                    r = send_to_daemon({
+                        "cmd": "move_if_idle" if require_idle else "move",
+                        "action": action,
+                    })
                 elif isinstance(action, dict):
-                    r = send_to_daemon(action)
+                    request = dict(action)
+                    if require_idle and request.get("cmd", "move") == "move":
+                        request["cmd"] = "move_if_idle"
+                    r = send_to_daemon(request)
                 else:
                     r = {"error": f"invalid action: {action}"}
                 results.append(r)
-            ok = all(not (isinstance(r, dict) and r.get("error")) for r in results)
-            self._send_json({"ok": ok, "results": results})
+            ok = all(
+                isinstance(r, dict)
+                and not r.get("error")
+                and r.get("ok", True)
+                for r in results
+            )
+            busy = any(
+                isinstance(r, dict) and r.get("busy")
+                for r in results
+            )
+            accepted = all(
+                isinstance(r, dict) and r.get("accepted", True)
+                for r in results
+            )
+            safety_stop = any(
+                isinstance(r, dict) and r.get("safety_stop")
+                for r in results
+            )
+            safety_result = next(
+                (
+                    r for r in results
+                    if isinstance(r, dict) and r.get("safety_stop")
+                ),
+                None,
+            )
+            self._send_json({
+                "ok": ok,
+                "accepted": accepted,
+                "busy": busy,
+                "safety_stop": safety_stop,
+                "distance_cm": (
+                    safety_result.get("distance_cm")
+                    if safety_result is not None else None
+                ),
+                "reason": (
+                    safety_result.get("reason")
+                    if safety_result is not None else None
+                ),
+                "require_idle": require_idle,
+                "results": results,
+            })
         
         elif path == "/speak":
             # Speak text (non-blocking: respond immediately, speak in background)
@@ -847,16 +924,8 @@ class BridgeHandler(BaseHTTPRequestHandler):
         elif path == "/behavior/stop":
             if _behavior_engine:
                 _behavior_engine.stop()
-                # Stopping the engine only stops NEW frames. Frames it already
-                # queued keep the dog moving for many seconds, and the `sleep`
-                # below would land behind them (issue #25) — so drain first.
-                motion = send_to_daemon({"cmd": "stop_motion"})
                 send_to_daemon({"cmd": "sleep"})
                 result = {"ok": True, "stopped": True}
-                if isinstance(motion, dict) and not motion.get("error"):
-                    result["motion_frames_dropped"] = motion.get("drained", 0)
-                elif isinstance(motion, dict):
-                    result["motion_error"] = motion["error"]
                 self._send_json(result)
             else:
                 self._send_json({"error": "behavior engine not running"}, 503)
@@ -866,6 +935,9 @@ class BridgeHandler(BaseHTTPRequestHandler):
             if _behavior_engine:
                 _behavior_engine.stop()
             self._send_json(r)
+
+        elif path == "/keep_awake":
+            self._send_json(send_to_daemon({"cmd": "keep_awake"}))
 
         elif path == "/move":
             # Higher-level movement: distance_cm or angle_deg (Sprint 4)
