@@ -26,18 +26,58 @@ from vosk import KaldiRecognizer, Model, SetLogLevel
 
 
 SAMPLE_RATE = 16000
-WAKE_WORDS = ("nox", "knox", "knocks")
+WAKE_WORDS = ("fluffy",)
 PHRASE_TO_COMMAND = {
+    # Desktop-assisted identity tracking.
     "select me": "select_me",
     "arm head": "arm_head",
     "track me": "arm_head",
     "follow me": "follow_me",
+
+    # Safety and posture.
     "stop": "stop",
     "emergency stop": "stop",
+    "sit": "sit",
+    "sit down": "sit",
+    "stand": "stand",
+    "stand up": "stand",
     "lie down": "lie_down",
     "lay down": "lie_down",
     "stop and lie down": "stop_and_lie_down",
     "stop and lay down": "stop_and_lie_down",
+    "go to sleep": "doze_off",
+
+    # Local social actions and tricks.
+    "paw": "hand_shake",
+    "give me your paw": "hand_shake",
+    "shake paws": "hand_shake",
+    "high five": "high_five",
+    "bark": "bark",
+    "howl": "howling",
+    "wag your tail": "wag_tail",
+    "wag tail": "wag_tail",
+    "stretch": "stretch",
+    "scratch": "scratch",
+    "pant": "pant",
+    "nod": "nod",
+    "shake your head": "shake_head",
+    "shake head": "shake_head",
+}
+
+LOCAL_MOVE_ACTIONS = {
+    "sit": ("sit", 60),
+    "stand": ("stand", 60),
+    "doze_off": ("doze_off", 70),
+    "hand_shake": ("hand_shake", 70),
+    "high_five": ("high_five", 70),
+    "bark": ("bark", 70),
+    "howling": ("howling", 70),
+    "wag_tail": ("wag_tail", 80),
+    "stretch": ("stretch", 70),
+    "scratch": ("scratch", 70),
+    "pant": ("pant", 70),
+    "nod": ("nod", 70),
+    "shake_head": ("shake_head", 70),
 }
 
 
@@ -80,7 +120,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--stop-without-wake",
         action=argparse.BooleanOptionalAction,
-        default=os.environ.get("NOX_STOP_WITHOUT_WAKE", "1") != "0",
+        default=os.environ.get("NOX_STOP_WITHOUT_WAKE", "0") != "0",
         help="Accept bare 'stop' as a fail-safe.",
     )
     parser.add_argument(
@@ -205,6 +245,14 @@ def run_local_action(args: argparse.Namespace, command: str) -> tuple[str | None
         daemon_command = {"cmd": "halt", "speed": 40}
     elif command in {"lie_down", "stop_and_lie_down"}:
         daemon_command = {"cmd": "lie_down", "speed": 40}
+    elif command in LOCAL_MOVE_ACTIONS:
+        action, speed = LOCAL_MOVE_ACTIONS[command]
+        daemon_command = {
+            "cmd": "move_if_idle",
+            "action": action,
+            "steps": 1,
+            "speed": speed,
+        }
     else:
         return None, {"ok": True, "not_local": True}
 
@@ -308,7 +356,7 @@ def main() -> int:
         "1",
     ]
     print(
-        f"[voice] Listening on {args.device}; say 'Nox' followed by a command",
+        f"[voice] Listening on {args.device}; say 'Fluffy' followed by a command",
         flush=True,
     )
     if args.stop_without_wake:
@@ -358,7 +406,7 @@ def main() -> int:
                 # separately from "Nox arm head". These fragments have no
                 # command authority and do not need to flood the journal.
                 harmless_fragments = {
-                    "nox", "knox", "knocks", "head", "arm", "track", "me"
+                    "fluffy", "head", "arm", "track", "me"
                 }
                 if text and text != "[unk]" and text not in harmless_fragments:
                     print(f"[voice] Ignored: {text!r}", flush=True)
