@@ -78,9 +78,11 @@ SSH to the Pi by the local route for this one-time setup:
 ssh david@raspberrypi.local
 ```
 
-On the Pi, install Tailscale using its official installer:
+On the Pi, install the required client tools and then Tailscale using its official installer:
 
 ```bash
+sudo apt update
+sudo apt install -y curl openssh-client
 curl -fsSL https://tailscale.com/install.sh | sh
 sudo systemctl enable --now tailscaled
 sudo tailscale up --hostname=pidog
