@@ -1,5 +1,5 @@
 [Unit]
-Description=PiDog local services and camera warm-up
+Description=PiDog local services and default H.264 camera startup
 Wants=network-online.target
 After=network-online.target sound.target
 StartLimitIntervalSec=0

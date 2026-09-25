@@ -1,11 +1,10 @@
 #!/usr/bin/env bash
 set -uo pipefail
 
-SERVICES=(nox-body.service nox-bridge.service nox-voice.service)
+SERVICES=(nox-body.service nox-bridge.service nox-voice.service pidog-h264.service)
 BRIDGE_HOST=127.0.0.1
 BRIDGE_PORT=8888
-CAMERA_PORT=9000
-WARM_FRAME=/tmp/pidog-camera-warmup.jpg
+H264_PORT=9001
 
 log()  { printf '[pidog-start] %s\n' "$*"; }
 fail() { printf '[pidog-start] ERROR: %s\n' "$*" >&2; exit 1; }
@@ -16,7 +15,7 @@ for unit in "${SERVICES[@]}"; do
     systemctl cat "$unit" >/dev/null 2>&1 || fail "$unit is not installed"
 done
 
-log "enabling PiDog services"
+log "enabling PiDog services (H.264 camera is the boot default)"
 systemctl enable "${SERVICES[@]}" >/dev/null
 
 log "starting body controller"
@@ -64,67 +63,36 @@ systemctl is-active --quiet nox-voice.service || {
     fail "offline voice service did not become active"
 }
 
-log "warming camera (the first frame can take several seconds)"
-rm -f "$WARM_FRAME"
-camera_ok=0
-for attempt in 1 2 3; do
-    if python3 - "$WARM_FRAME" <<'PY'
-import sys
-import urllib.request
+# Do not request /frame.jpg here: that would make ViLib claim the camera before
+# the hardware H.264 streamer. Snapshot/MJPEG remains available on demand via
+# 'sudo pidog-camera-mode snapshot'.
+log "starting low-latency H.264 camera on 127.0.0.1:$H264_PORT"
+systemctl start pidog-h264.service || fail "could not start pidog-h264.service"
 
-destination = sys.argv[1]
-try:
-    with urllib.request.urlopen("http://127.0.0.1:8888/frame.jpg", timeout=20) as response:
-        payload = response.read()
-        content_type = response.headers.get("Content-Type", "")
-        if response.status != 200 or "image/jpeg" not in content_type or len(payload) < 1000:
-            raise RuntimeError(
-                f"unexpected response: status={response.status}, "
-                f"type={content_type!r}, bytes={len(payload)}"
-            )
-    with open(destination, "wb") as output:
-        output.write(payload)
-    print(f"[pidog-start] camera frame ready ({len(payload)} bytes)")
-except Exception as exc:
-    print(f"[pidog-start] camera attempt failed: {exc}", file=sys.stderr)
-    raise SystemExit(1)
-PY
-    then
-        camera_ok=1
-        break
-    fi
-    log "retrying camera ($attempt/3)"
-    sleep 2
-done
-
-if [[ $camera_ok -ne 1 ]]; then
-    journalctl -u nox-body.service -u nox-bridge.service -n 35 --no-pager -l >&2
-    fail "camera warm-up failed"
-fi
-
-stream_ok=0
-for _ in {1..20}; do
-    if python3 - "$CAMERA_PORT" <<'PY' >/dev/null 2>&1
+h264_ok=0
+for _ in {1..40}; do
+    if systemctl is-active --quiet pidog-h264.service &&
+       python3 - "$H264_PORT" <<'PY' >/dev/null 2>&1
 import socket, sys
 with socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=0.5):
     pass
 PY
     then
-        stream_ok=1
+        h264_ok=1
         break
     fi
     sleep 0.5
 done
+
+if [[ $h264_ok -ne 1 ]]; then
+    journalctl -u pidog-h264.service -u nox-body.service -n 40 --no-pager -l >&2
+    fail "H.264 camera stream did not open port $H264_PORT"
+fi
 
 log "service state:"
 for unit in "${SERVICES[@]}"; do
     printf '  %-22s %s\n' "$unit" "$(systemctl is-active "$unit" 2>/dev/null || true)"
 done
 printf '  %-22s %s\n' "bridge :$BRIDGE_PORT" "ready"
-if [[ $stream_ok -eq 1 ]]; then
-    printf '  %-22s %s\n' "camera :$CAMERA_PORT" "ready"
-else
-    fail "frame capture worked, but camera stream port $CAMERA_PORT did not open"
-fi
-
-log "PiDog local services and camera are ready"
+printf '  %-22s %s\n' "H.264 camera :$H264_PORT" "ready"
+log "PiDog local services and H.264 camera are ready"
