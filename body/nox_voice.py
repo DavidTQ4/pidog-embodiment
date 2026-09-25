@@ -130,6 +130,12 @@ def parse_args() -> argparse.Namespace:
         help="Minimum mean Vosk confidence for wake-word commands.",
     )
     parser.add_argument(
+        "--bark-ack",
+        action=argparse.BooleanOptionalAction,
+        default=os.environ.get("NOX_VOICE_BARK_ACK", "1") != "0",
+        help="Acknowledge accepted commands with the short single_bark_1 sound.",
+    )
+    parser.add_argument(
         "--bare-stop-minimum-confidence",
         type=float,
         default=float(os.environ.get("NOX_BARE_STOP_MIN_CONFIDENCE", "0.72")),
@@ -277,6 +283,22 @@ def run_local_action(args: argparse.Namespace, command: str) -> tuple[str | None
                 "ok": False,
                 "error": f"bridge and daemon failed: {daemon_error}",
             }
+
+
+def acknowledge_command(args: argparse.Namespace, command: str) -> bool:
+    """Play a short speaker bark without adding a physical movement."""
+    if not args.bark_ack or command == "bark":
+        return True
+    try:
+        result = daemon_json(
+            args.daemon_host,
+            args.daemon_port,
+            {"cmd": "sound", "name": "single_bark_1"},
+        )
+        return bool(result.get("ok"))
+    except Exception as exc:
+        print(f"[voice] Bark acknowledgement failed: {exc}", flush=True)
+        return False
 
 
 def relay_command(
@@ -445,10 +467,25 @@ def main() -> int:
                 local_action,
                 local_result,
             )
+            local_accepted = (
+                local_action is None
+                or (
+                    bool(local_result.get("ok"))
+                    and bool(local_result.get("accepted", True))
+                )
+            )
+            command_accepted = (
+                relayed if local_action is None else local_accepted
+            )
+            bark_ack = (
+                acknowledge_command(args, command)
+                if command_accepted
+                else False
+            )
             print(
                 f"[voice] ACCEPTED {command}: text={text!r} "
                 f"confidence={confidence} local_ok={local_result.get('ok')} "
-                f"desktop_relay={relayed}",
+                f"desktop_relay={relayed} bark_ack={bark_ack}",
                 flush=True,
             )
     finally:
