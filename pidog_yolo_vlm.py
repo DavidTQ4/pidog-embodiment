@@ -721,28 +721,28 @@ def synthesize_windows_speech(text: str) -> bytes:
             "Desktop TTS currently requires Windows System.Speech"
         )
 
-    powershell = r"""
+    with tempfile.TemporaryDirectory(prefix="pidog_tts_") as directory:
+        wav_path = Path(directory) / "speech.wav"
+        text_b64 = base64.b64encode(text.encode("utf-8")).decode("ascii")
+        wav_literal = str(wav_path).replace("'", "''")
+        powershell = f"""
 Add-Type -AssemblyName System.Speech
-$textPath = $args[0]
-$wavPath = $args[1]
+$wavPath = '{wav_literal}'
+$textBytes = [System.Convert]::FromBase64String('{text_b64}')
+$text = [System.Text.Encoding]::UTF8.GetString($textBytes)
 $synth = New-Object System.Speech.Synthesis.SpeechSynthesizer
-try {
+try {{
     $synth.Rate = 1
     $synth.SetOutputToWaveFile($wavPath)
-    $text = [System.IO.File]::ReadAllText(
-        $textPath,
-        [System.Text.Encoding]::UTF8
-    )
     $synth.Speak($text)
-}
-finally {
+}}
+finally {{
     $synth.Dispose()
-}
+}}
 """
-    with tempfile.TemporaryDirectory(prefix="pidog_tts_") as directory:
-        text_path = Path(directory) / "speech.txt"
-        wav_path = Path(directory) / "speech.wav"
-        text_path.write_text(text, encoding="utf-8")
+        encoded_command = base64.b64encode(
+            powershell.encode("utf-16le")
+        ).decode("ascii")
         completed = subprocess.run(
             [
                 "powershell.exe",
@@ -751,10 +751,8 @@ finally {
                 "-NonInteractive",
                 "-ExecutionPolicy",
                 "Bypass",
-                "-Command",
-                powershell,
-                str(text_path),
-                str(wav_path),
+                "-EncodedCommand",
+                encoded_command,
             ],
             capture_output=True,
             text=True,
