@@ -509,15 +509,30 @@ def main() -> int:
             if not speech_complete and not command_complete:
                 continue
 
-            audio = bytes(utterance_audio)
-            utterance_audio.clear()
-            result = (
-                json.loads(recognizer.Result()) if speech_complete else {}
-            )
             command_result = (
                 json.loads(command_recognizer.Result())
                 if command_complete
                 else {}
+            )
+            # The constrained grammar decoder can endpoint early on [unk]
+            # while the unrestricted decoder is still collecting a longer
+            # conversational utterance. Do not discard the shared PCM buffer
+            # unless that early endpoint is an actual deterministic command.
+            if command_complete and not speech_complete:
+                preliminary_text = " ".join(
+                    command_result.get("text", "").split()
+                )
+                preliminary_command = canonical_command(
+                    preliminary_text,
+                    args.stop_without_wake,
+                )
+                if preliminary_command is None:
+                    continue
+
+            audio = bytes(utterance_audio)
+            utterance_audio.clear()
+            result = (
+                json.loads(recognizer.Result()) if speech_complete else {}
             )
             text = " ".join(result.get("text", "").split())
             command_text = " ".join(
