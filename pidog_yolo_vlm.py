@@ -790,26 +790,30 @@ class VLMObserver:
     ) -> None:
         started = time.perf_counter()
         try:
-            transcript = fallback_text
-            if audio:
+            # Vosk has already recognised and confidence-gated the wake-word
+            # utterance on the Pi. Prefer that exact accepted transcript so a
+            # second ASR model cannot replace a good question with a generic
+            # Whisper silence hallucination such as "Thank you."
+            transcript = fallback_text.strip()
+            words = transcript.split()
+            if words and words[0].lower().rstrip(",.!?") == "fluffy":
+                transcript = " ".join(words[1:]).strip()
+            asr_source = "Pi Vosk"
+
+            # Retain desktop Whisper only as a recovery path for a malformed
+            # relay that contains audio but no usable Pi transcript.
+            if not transcript and audio:
                 samples = np.frombuffer(audio, dtype="<i2").astype(np.float32)
                 samples /= 32768.0
-                # The .en Whisper checkpoints are English-only. Recent
-                # Transformers versions reject language/task generation
-                # options for these models; their defaults already perform
-                # English transcription.
                 transcription = self._get_transcriber()(
                     {"raw": samples, "sampling_rate": sample_rate},
                 )
-                candidate = str(transcription.get("text", "")).strip()
-                if candidate:
-                    transcript = candidate
+                transcript = str(transcription.get("text", "")).strip()
+                asr_source = "desktop Whisper fallback"
 
-            words = transcript.strip().split()
-            if words and words[0].lower().rstrip(",.!?") == "fluffy":
-                transcript = " ".join(words[1:]).strip()
             if not transcript:
                 transcript = "What did you hear me say?"
+                asr_source = "empty-transcript fallback"
 
             scene_age = (
                 round(time.time() - self.last_scene_time, 1)
@@ -894,6 +898,7 @@ class VLMObserver:
                 self.state.running = False
             print(
                 f"\nCONVERSATION ({seconds:.2f}s)\n"
+                f"ASR: {asr_source}\n"
                 f"HEARD: {transcript}\n"
                 f"FLUFFY: {result}\n"
             )
