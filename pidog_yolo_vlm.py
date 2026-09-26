@@ -59,11 +59,16 @@ except ImportError:
     ollama_chat = None
     ollama_web_fetch = None
     ollama_web_search = None
+
+try:
+    from faster_whisper import WhisperModel
+except ImportError:
+    WhisperModel = None
+
 from PIL import Image
 from transformers import (
     AutoProcessor,
     Qwen3VLForConditionalGeneration,
-    pipeline,
 )
 from ultralytics import YOLO
 
@@ -82,6 +87,8 @@ DEFAULT_STREAM = "tcp://127.0.0.1:19001"
 DEFAULT_ROBOT_API = "http://127.0.0.1:18888"
 DEFAULT_VLM_MODEL = "Qwen/Qwen3-VL-4B-Instruct"
 DEFAULT_CONVERSATION_MODEL = "qwen3:8b"
+DEFAULT_ASR_MODEL = "large-v3-turbo"
+DEFAULT_ASR_WORD_CONFIDENCE = 0.70
 DEFAULT_YOLO_MODEL = "yolo11n.pt"
 DEFAULT_POSE_MODEL = "yolo11n-pose.pt"
 DEFAULT_PROMPT = (
@@ -634,6 +641,8 @@ class VLMObserver:
         max_new_tokens: int,
         conversation_model: str,
         web_search_enabled: bool,
+        asr_model: str,
+        asr_word_confidence: float,
     ):
         if not torch.cuda.is_available():
             raise RuntimeError(
@@ -644,6 +653,8 @@ class VLMObserver:
         self.max_new_tokens = max_new_tokens
         self.conversation_model = conversation_model.strip()
         self.web_search_enabled = web_search_enabled
+        self.asr_model = asr_model.strip()
+        self.asr_word_confidence = float(asr_word_confidence)
         self.state = AnalysisState()
         self.lock = threading.Lock()
         self.conversation_history: deque[dict[str, str]] = deque(maxlen=12)
@@ -824,16 +835,79 @@ class VLMObserver:
         return True
 
     def _get_transcriber(self):
-        if self.transcriber is None:
-            print("Loading desktop Whisper: openai/whisper-base.en")
-            self.transcriber = pipeline(
-                "automatic-speech-recognition",
-                model="openai/whisper-base.en",
-                device=0,
-                dtype=torch.float16,
+        if WhisperModel is None:
+            raise RuntimeError(
+                "Faster-Whisper is not installed; run: "
+                "python -m pip install --upgrade faster-whisper"
             )
-            print("Desktop Whisper ready")
+        if self.transcriber is None:
+            print(
+                f"Loading Faster-Whisper ASR: {self.asr_model} "
+                "(CUDA int8_float16)"
+            )
+            self.transcriber = WhisperModel(
+                self.asr_model,
+                device="cuda",
+                compute_type="int8_float16",
+            )
+            print("Faster-Whisper ready")
         return self.transcriber
+
+    @staticmethod
+    def _remove_wake_word(text: str) -> str:
+        """Remove one leading Fluffy wake phrase without altering later text."""
+        words = text.strip().split()
+        for index, word in enumerate(words[:3]):
+            if word.lower().strip(",.!?") == "fluffy":
+                return " ".join(words[index + 1:]).strip()
+        return text.strip()
+
+    def _transcribe_conversation(
+        self,
+        audio: bytes,
+        sample_rate: int,
+    ) -> tuple[str, str, int, int]:
+        """Return confidence-filtered text and diagnostics for one utterance."""
+        if sample_rate != 16000:
+            raise ValueError(
+                f"Faster-Whisper expects 16000 Hz audio, received {sample_rate}"
+            )
+        samples = np.frombuffer(audio, dtype="<i2").astype(np.float32)
+        samples /= 32768.0
+        segments, _ = self._get_transcriber().transcribe(
+            samples,
+            language="en",
+            beam_size=5,
+            word_timestamps=True,
+            condition_on_previous_text=False,
+            vad_filter=True,
+            vad_parameters={"min_silence_duration_ms": 300},
+            initial_prompt=(
+                "The robot dog's name is Fluffy. People may be named David "
+                "or Joss. Terms include PiDog, YOLO, Ollama and Raspberry Pi."
+            ),
+        )
+        completed_segments = list(segments)
+        raw_text = " ".join(
+            segment.text.strip()
+            for segment in completed_segments
+            if segment.text.strip()
+        ).strip()
+
+        all_words = []
+        accepted_words = []
+        for segment in completed_segments:
+            for word in segment.words or []:
+                token = word.word.strip()
+                if not token:
+                    continue
+                probability = float(word.probability or 0.0)
+                all_words.append((token, probability))
+                if probability >= self.asr_word_confidence:
+                    accepted_words.append(token)
+
+        filtered_text = self._remove_wake_word(" ".join(accepted_words))
+        return filtered_text, raw_text, len(accepted_words), len(all_words)
 
     def _answer_with_ollama(
         self,
@@ -924,27 +998,64 @@ class VLMObserver:
     ) -> None:
         started = time.perf_counter()
         try:
-            # Vosk has already recognised and confidence-gated the wake-word
-            # utterance on the Pi. Prefer that exact accepted transcript so a
-            # second ASR model cannot replace a good question with a generic
-            # Whisper silence hallucination such as "Thank you."
-            transcript = fallback_text.strip()
-            words = transcript.split()
-            if words and words[0].lower().rstrip(",.!?") == "fluffy":
-                transcript = " ".join(words[1:]).strip()
-            asr_source = "Pi Vosk"
+            # The Pi retains responsibility for wake-word gating and
+            # deterministic commands. Conversational audio is transcribed on
+            # the desktop, where low-confidence words can be rejected without
+            # affecting the robot's safety controls.
+            vosk_transcript = self._remove_wake_word(fallback_text)
+            transcript = ""
+            asr_source = "Pi Vosk fallback"
+            if audio:
+                try:
+                    (
+                        whisper_text,
+                        whisper_raw,
+                        accepted_words,
+                        total_words,
+                    ) = self._transcribe_conversation(audio, sample_rate)
+                    coverage = (
+                        accepted_words / total_words
+                        if total_words
+                        else 0.0
+                    )
+                    generic_silence_phrases = {
+                        "thank you",
+                        "thanks for watching",
+                        "bye",
+                        "goodbye",
+                    }
+                    generic_hallucination = (
+                        whisper_text.lower().strip(" .!?")
+                        in generic_silence_phrases
+                        and len(vosk_transcript.split()) > 2
+                    )
+                    print(
+                        "[ASR] Faster-Whisper raw="
+                        f"{whisper_raw!r} | retained={whisper_text!r} | "
+                        f"words={accepted_words}/{total_words} "
+                        f"threshold={self.asr_word_confidence:.2f}"
+                    )
+                    if whisper_text and not generic_hallucination:
+                        transcript = whisper_text
+                        asr_source = (
+                            "Faster-Whisper "
+                            f"(word confidence >= "
+                            f"{self.asr_word_confidence:.2f}, "
+                            f"coverage {coverage:.0%})"
+                        )
+                    elif generic_hallucination:
+                        print(
+                            "[ASR] rejected generic silence hallucination; "
+                            "using Pi Vosk transcript"
+                        )
+                except Exception as asr_error:
+                    print(
+                        "[ASR] Faster-Whisper failed; using Pi Vosk: "
+                        f"{type(asr_error).__name__}: {asr_error}"
+                    )
 
-            # Retain desktop Whisper only as a recovery path for a malformed
-            # relay that contains audio but no usable Pi transcript.
-            if not transcript and audio:
-                samples = np.frombuffer(audio, dtype="<i2").astype(np.float32)
-                samples /= 32768.0
-                transcription = self._get_transcriber()(
-                    {"raw": samples, "sampling_rate": sample_rate},
-                )
-                transcript = str(transcription.get("text", "")).strip()
-                asr_source = "desktop Whisper fallback"
-
+            if not transcript:
+                transcript = vosk_transcript
             if not transcript:
                 transcript = "What did you hear me say?"
                 asr_source = "empty-transcript fallback"
@@ -1857,6 +1968,20 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Do not offer Ollama web-search and webpage-fetch tools.",
     )
+    parser.add_argument(
+        "--asr-model",
+        default=DEFAULT_ASR_MODEL,
+        help="Faster-Whisper model used for conversational speech.",
+    )
+    parser.add_argument(
+        "--asr-word-confidence",
+        type=float,
+        default=DEFAULT_ASR_WORD_CONFIDENCE,
+        help=(
+            "Only conversational Whisper words at or above this probability "
+            "are sent to the LLM; rejected/empty results fall back to Pi Vosk."
+        ),
+    )
     parser.add_argument("--yolo-model", default=DEFAULT_YOLO_MODEL)
     parser.add_argument("--pose-model", default=DEFAULT_POSE_MODEL)
     parser.add_argument(
@@ -2000,6 +2125,8 @@ def main() -> None:
         raise ValueError("--face-fps must be greater than zero")
     if args.face_margin < 0:
         raise ValueError("--face-margin cannot be negative")
+    if not 0.0 <= args.asr_word_confidence <= 1.0:
+        raise ValueError("--asr-word-confidence must be between 0 and 1")
     if not 10.0 <= args.turn_yaw_threshold <= 70.0:
         raise ValueError("--turn-yaw-threshold must be between 10 and 70")
     if not 0.12 <= args.body_turn_screen_threshold <= 0.60:
@@ -2061,6 +2188,8 @@ def main() -> None:
         args.max_new_tokens,
         args.conversation_model,
         not args.disable_web_search,
+        args.asr_model,
+        args.asr_word_confidence,
     )
     robot_session = requests.Session()
     head_controller = LatestHeadController(args.robot_api)
