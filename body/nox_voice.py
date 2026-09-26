@@ -10,6 +10,7 @@ for a spoken stop.
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import os
 import signal
@@ -333,6 +334,37 @@ def relay_command(
         return False
 
 
+def relay_conversation(
+    args: argparse.Namespace,
+    text: str,
+    confidence: float | None,
+    audio: bytes,
+) -> bool:
+    """Relay one wake-word utterance and its PCM audio for desktop Whisper."""
+    payload = {
+        "text": text,
+        "source": "pidog_vosk_conversation",
+        "command": "conversation",
+        "audio_b64": base64.b64encode(audio).decode("ascii"),
+        "sample_rate": SAMPLE_RATE,
+        "sample_width": 2,
+        "channels": 1,
+    }
+    if confidence is not None:
+        payload["confidence"] = confidence
+    try:
+        response = http_json(
+            "POST",
+            f"{args.bridge.rstrip('/')}/voice/input",
+            payload,
+            timeout=5.0,
+        )
+        return bool(response.get("ok"))
+    except Exception as exc:
+        print(f"[voice] Could not relay conversation audio: {exc}", flush=True)
+        return False
+
+
 def echo_suppressed(args: argparse.Namespace) -> bool:
     try:
         status = http_json(
@@ -362,8 +394,9 @@ def main() -> int:
     SetLogLevel(-1)
     print(f"[voice] Loading Vosk model: {model_path}", flush=True)
     model = Model(str(model_path))
-    grammar = grammar_phrases(args.stop_without_wake)
-    recognizer = KaldiRecognizer(model, SAMPLE_RATE, json.dumps(grammar))
+    # Unrestricted recognition allows wake-word conversation. Exact command
+    # matching and confidence gates below still own all physical actions.
+    recognizer = KaldiRecognizer(model, SAMPLE_RATE)
     recognizer.SetWords(True)
 
     arecord_command = [
@@ -401,6 +434,8 @@ def main() -> int:
     last_command_time = 0.0
     last_echo_check = 0.0
     suppress_echo = False
+    utterance_audio = bytearray()
+    max_utterance_bytes = SAMPLE_RATE * 2 * 20
 
     try:
         while not stopping:
@@ -417,29 +452,77 @@ def main() -> int:
                 last_echo_check = now
             if suppress_echo:
                 recognizer.Reset()
+                utterance_audio.clear()
                 continue
 
             chunk = apply_gain(chunk, args.gain)
+            utterance_audio.extend(chunk)
+            if len(utterance_audio) > max_utterance_bytes:
+                print("[voice] Discarded utterance longer than 20 seconds", flush=True)
+                recognizer.Reset()
+                utterance_audio.clear()
+                continue
             if not recognizer.AcceptWaveform(chunk):
                 continue
 
+            audio = bytes(utterance_audio)
+            utterance_audio.clear()
             result = json.loads(recognizer.Result())
             text = " ".join(result.get("text", "").split())
             command = canonical_command(text, args.stop_without_wake)
-            if command is None:
-                # Vosk often finalises a trailing fragment such as "head"
-                # separately from "Nox arm head". These fragments have no
-                # command authority and do not need to flood the journal.
-                harmless_fragments = {
-                    "fluffy", "head", "arm", "track", "me", "what", "see"
-                }
-                if text and text != "[unk]" and text not in harmless_fragments:
-                    print(f"[voice] Ignored: {text!r}", flush=True)
-                continue
-
             confidence = result_confidence(result)
             words = text.lower().strip().split()
             has_wake_word = bool(words and words[0] in WAKE_WORDS)
+
+            if command is None:
+                if not has_wake_word:
+                    harmless_fragments = {
+                        "fluffy", "head", "arm", "track", "me", "what", "see"
+                    }
+                    if (
+                        text
+                        and text != "[unk]"
+                        and text not in harmless_fragments
+                    ):
+                        print(f"[voice] Ignored: {text!r}", flush=True)
+                    continue
+                if confidence is None or confidence < args.minimum_confidence:
+                    print(
+                        "[voice] REJECTED low-confidence conversation: "
+                        f"text={text!r} confidence={confidence} "
+                        f"required={args.minimum_confidence:.2f}",
+                        flush=True,
+                    )
+                    continue
+
+                now = time.monotonic()
+                if (
+                    text == last_command
+                    and now - last_command_time < args.debounce_seconds
+                ):
+                    print("[voice] Debounced duplicate conversation", flush=True)
+                    continue
+                last_command = text
+                last_command_time = now
+                relayed = relay_conversation(
+                    args,
+                    text,
+                    confidence,
+                    audio,
+                )
+                bark_ack = (
+                    acknowledge_command(args, "conversation")
+                    if relayed
+                    else False
+                )
+                print(
+                    f"[voice] ACCEPTED conversation: text={text!r} "
+                    f"confidence={confidence} audio_bytes={len(audio)} "
+                    f"desktop_relay={relayed} bark_ack={bark_ack}",
+                    flush=True,
+                )
+                continue
+
             minimum_confidence = (
                 args.minimum_confidence
                 if has_wake_word

@@ -929,6 +929,10 @@ class BridgeHandler(BaseHTTPRequestHandler):
                     "speaker",
                     "local_action",
                     "local_ok",
+                    "audio_b64",
+                    "sample_rate",
+                    "sample_width",
+                    "channels",
                 ):
                     if key in body:
                         msg[key] = body[key]

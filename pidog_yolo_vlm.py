@@ -49,7 +49,11 @@ import numpy as np
 import requests
 import torch
 from PIL import Image
-from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
+from transformers import (
+    AutoProcessor,
+    Qwen3VLForConditionalGeneration,
+    pipeline,
+)
 from ultralytics import YOLO
 
 from pidog_face_identity import (
@@ -590,6 +594,10 @@ class VLMObserver:
         self.max_new_tokens = max_new_tokens
         self.state = AnalysisState()
         self.lock = threading.Lock()
+        self.conversation_history: deque[dict[str, str]] = deque(maxlen=12)
+        self.transcriber = None
+        self.last_scene_text = ""
+        self.last_scene_time = 0.0
 
         print(f"GPU: {torch.cuda.get_device_name(0)}")
         print(f"Loading VLM: {model_id}")
@@ -691,6 +699,8 @@ class VLMObserver:
                 self.state.text = result or "Model returned an empty response"
                 self.state.seconds = seconds
                 self.state.running = False
+                self.last_scene_text = result
+                self.last_scene_time = time.time()
             print(
                 f"\nVLM ({seconds:.2f}s, {len(detections)} YOLO tracks):\n"
                 f"{result}\n"
@@ -712,6 +722,185 @@ class VLMObserver:
                 self.state.error = message
                 self.state.running = False
             print(f"\nVLM error: {message}\n")
+
+
+    def submit_conversation(
+        self,
+        audio: bytes,
+        sample_rate: int,
+        fallback_text: str,
+        robot_context: dict[str, object],
+        on_complete=None,
+    ) -> bool:
+        """Transcribe and answer one conversational voice turn asynchronously."""
+        with self.lock:
+            if self.state.running:
+                return False
+            self.state.running = True
+            self.state.error = None
+            self.state.text = "Listening and preparing a response..."
+            self.state.seconds = None
+            self.state.detections_used = 0
+
+        threading.Thread(
+            target=self._converse,
+            args=(
+                bytes(audio),
+                int(sample_rate),
+                fallback_text,
+                dict(robot_context),
+                on_complete,
+            ),
+            daemon=True,
+        ).start()
+        return True
+
+    def _get_transcriber(self):
+        if self.transcriber is None:
+            print("Loading desktop Whisper: openai/whisper-base.en")
+            self.transcriber = pipeline(
+                "automatic-speech-recognition",
+                model="openai/whisper-base.en",
+                device=0,
+                dtype=torch.float16,
+            )
+            print("Desktop Whisper ready")
+        return self.transcriber
+
+    def _converse(
+        self,
+        audio: bytes,
+        sample_rate: int,
+        fallback_text: str,
+        robot_context: dict[str, object],
+        on_complete=None,
+    ) -> None:
+        started = time.perf_counter()
+        try:
+            transcript = fallback_text
+            if audio:
+                samples = np.frombuffer(audio, dtype="<i2").astype(np.float32)
+                samples /= 32768.0
+                transcription = self._get_transcriber()(
+                    {"raw": samples, "sampling_rate": sample_rate},
+                    generate_kwargs={
+                        "language": "english",
+                        "task": "transcribe",
+                    },
+                )
+                candidate = str(transcription.get("text", "")).strip()
+                if candidate:
+                    transcript = candidate
+
+            words = transcript.strip().split()
+            if words and words[0].lower().rstrip(",.!?") == "fluffy":
+                transcript = " ".join(words[1:]).strip()
+            if not transcript:
+                transcript = "What did you hear me say?"
+
+            scene_age = (
+                round(time.time() - self.last_scene_time, 1)
+                if self.last_scene_time
+                else None
+            )
+            context = dict(robot_context)
+            context["last_visual_description"] = self.last_scene_text or None
+            context["visual_description_age_seconds"] = scene_age
+
+            system_prompt = (
+                "You are Fluffy, an embodied robot dog speaking with a person. "
+                "Be warm, curious and concise without pretending to be a real "
+                "animal. Ground every claim about sight, identity, movement, "
+                "distance and completed actions in the supplied robot state. "
+                "A visible identity is not proof of who is speaking. Never claim "
+                "that a requested action happened unless its confirmed state or "
+                "result says so. You have no authority to invent or directly "
+                "execute movement. If asked to do something outside the existing "
+                "voice commands, explain that briefly. Reply in plain spoken "
+                "English, normally one to three sentences, with no markdown."
+            )
+            context_text = json.dumps(context, ensure_ascii=False)
+            messages = [
+                {
+                    "role": "system",
+                    "content": [{"type": "text", "text": system_prompt}],
+                }
+            ]
+            for item in self.conversation_history:
+                messages.append({
+                    "role": item["role"],
+                    "content": [{"type": "text", "text": item["content"]}],
+                })
+            messages.append({
+                "role": "user",
+                "content": [{
+                    "type": "text",
+                    "text": (
+                        f"Current verified robot state:\n{context_text}\n\n"
+                        f"Person says: {transcript}"
+                    ),
+                }],
+            })
+
+            inputs = self.processor.apply_chat_template(
+                messages,
+                tokenize=True,
+                add_generation_prompt=True,
+                return_dict=True,
+                return_tensors="pt",
+            ).to(self.model.device)
+            input_length = inputs["input_ids"].shape[1]
+            with torch.inference_mode():
+                output_ids = self.model.generate(
+                    **inputs,
+                    max_new_tokens=min(self.max_new_tokens, 180),
+                    do_sample=False,
+                    use_cache=True,
+                )
+            generated_ids = output_ids[:, input_length:]
+            result = self.processor.batch_decode(
+                generated_ids,
+                skip_special_tokens=True,
+                clean_up_tokenization_spaces=False,
+            )[0].strip()
+            if not result:
+                result = "I am not sure how to answer that yet."
+
+            seconds = time.perf_counter() - started
+            with self.lock:
+                self.conversation_history.append({
+                    "role": "user",
+                    "content": transcript,
+                })
+                self.conversation_history.append({
+                    "role": "assistant",
+                    "content": result,
+                })
+                self.state.text = result
+                self.state.seconds = seconds
+                self.state.running = False
+            print(
+                f"\nCONVERSATION ({seconds:.2f}s)\n"
+                f"HEARD: {transcript}\n"
+                f"FLUFFY: {result}\n"
+            )
+            if on_complete is not None:
+                try:
+                    on_complete(result)
+                except Exception as callback_error:
+                    print(
+                        "Conversation speech callback failed: "
+                        f"{type(callback_error).__name__}: {callback_error}"
+                    )
+        except Exception as exc:
+            seconds = time.perf_counter() - started
+            message = f"{type(exc).__name__}: {exc}"
+            with self.lock:
+                self.state.text = "Conversation failed; see terminal"
+                self.state.seconds = seconds
+                self.state.error = message
+                self.state.running = False
+            print(f"\nConversation error: {message}\n")
 
 
 def synthesize_windows_speech(text: str) -> bytes:
@@ -922,6 +1111,7 @@ def voice_message_command(message: dict[str, object]) -> str | None:
         "arm_head",
         "follow_me",
         "describe_scene",
+        "conversation",
         "stop",
         "lie_down",
         "stop_and_lie_down",
@@ -1708,6 +1898,7 @@ def main() -> None:
     voice_command_queue: deque[tuple[str, dict[str, object]]] = deque()
     voice_poller: VoiceCommandPoller | None = None
     last_voice_error_log_time = 0.0
+    voice_event_history: deque[dict[str, object]] = deque(maxlen=12)
 
     print(
         "1-9: select person | 0: clear | C: centre | M: head arm/disarm | "
@@ -1725,7 +1916,7 @@ def main() -> None:
         voice_poller.start()
         print(
             "Voice commands enabled asynchronously: select me | arm head | "
-            "follow me | what do you see | stop | lie down"
+            "follow me | what do you see | conversation | stop | lie down"
         )
     try:
         deadline = time.monotonic() + 15
@@ -2576,6 +2767,13 @@ def main() -> None:
                     f"(heard={voice_message.get('text')!r}, "
                     f"confidence={confidence})"
                 )
+                voice_event_history.append({
+                    "time": round(time.time(), 3),
+                    "command": voice_command,
+                    "heard": voice_message.get("text"),
+                    "local_action": voice_message.get("local_action"),
+                    "local_ok": voice_message.get("local_ok"),
+                })
                 if voice_command in {
                     "stop",
                     "lie_down",
@@ -2594,6 +2792,69 @@ def main() -> None:
                         f"Voice {voice_command}: head/body following DISARMED; "
                         f"local posture action {local_status}"
                     )
+                elif key == 255 and voice_command == "conversation":
+                    encoded_audio = voice_message.get("audio_b64")
+                    try:
+                        if not isinstance(encoded_audio, str):
+                            raise ValueError("conversation message has no audio")
+                        conversation_audio = base64.b64decode(
+                            encoded_audio,
+                            validate=True,
+                        )
+                        sample_rate = int(
+                            voice_message.get("sample_rate", 16000)
+                        )
+                        if not 8000 <= sample_rate <= 48000:
+                            raise ValueError(
+                                f"invalid sample rate: {sample_rate}"
+                            )
+                        robot_context = {
+                            "robot_name": "Fluffy",
+                            "speaker_identity": "unknown",
+                            "selected_visible_identity": selected_identity,
+                            "selected_track_id": selected_track_id,
+                            "head_tracking_armed": movement_enabled,
+                            "body_following_armed": turning_enabled,
+                            "head_yaw_degrees": round(yaw, 1),
+                            "head_pitch_degrees": round(pitch, 1),
+                            "ultrasonic_distance_cm": last_body_distance,
+                            "body_safety_stopped": body_safety_stopped,
+                            "last_safety_reason": last_safety_reason,
+                            "visible_detections": [
+                                item.prompt_record()
+                                for item in yolo_state.detections
+                            ],
+                            "recent_voice_events": list(
+                                voice_event_history
+                            ),
+                        }
+                        accepted = vlm.submit_conversation(
+                            conversation_audio,
+                            sample_rate,
+                            str(voice_message.get("text", "")),
+                            robot_context,
+                            on_complete=lambda result: speak_robot(
+                                args.robot_api,
+                                result,
+                            ),
+                        )
+                        if accepted:
+                            print(
+                                "Conversational turn accepted; desktop "
+                                "Whisper and Fluffy LLM response started"
+                            )
+                        else:
+                            print(
+                                "Conversation ignored because Qwen is "
+                                "already processing another request"
+                            )
+                            speak_robot(
+                                args.robot_api,
+                                "I am still thinking about the previous request.",
+                            )
+                    except Exception as exc:
+                        print(f"Conversation request rejected: {exc}")
+                    key = 255
                 elif key == 255 and voice_command == "describe_scene":
                     speak_analysis_result = True
                     key = ord("v")
