@@ -781,12 +781,12 @@ class VLMObserver:
             if audio:
                 samples = np.frombuffer(audio, dtype="<i2").astype(np.float32)
                 samples /= 32768.0
+                # The .en Whisper checkpoints are English-only. Recent
+                # Transformers versions reject language/task generation
+                # options for these models; their defaults already perform
+                # English transcription.
                 transcription = self._get_transcriber()(
                     {"raw": samples, "sampling_rate": sample_rate},
-                    generate_kwargs={
-                        "language": "english",
-                        "task": "transcribe",
-                    },
                 )
                 candidate = str(transcription.get("text", "")).strip()
                 if candidate:
