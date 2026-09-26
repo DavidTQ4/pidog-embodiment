@@ -993,6 +993,20 @@ def speak_robot(robot_api: str, text: str) -> None:
     )
 
 
+def sound_direction_to_head_yaw(direction_deg: object) -> float | None:
+    """Map PiDog's clockwise acoustic bearing to bounded head yaw."""
+    try:
+        direction = float(direction_deg) % 360.0
+    except (TypeError, ValueError):
+        return None
+    if direction <= 160.0:
+        return float(np.clip(-direction, YAW_LIMITS[0], YAW_LIMITS[1]))
+    if direction >= 200.0:
+        return float(np.clip(360.0 - direction, YAW_LIMITS[0], YAW_LIMITS[1]))
+    # A head-only movement cannot resolve the ambiguous rear sector safely.
+    return None
+
+
 def command_head(
     session: requests.Session,
     robot_api: str,
@@ -2784,7 +2798,43 @@ def main() -> None:
                     "heard": voice_message.get("text"),
                     "local_action": voice_message.get("local_action"),
                     "local_ok": voice_message.get("local_ok"),
+                    "sound_direction_deg": voice_message.get(
+                        "sound_direction_deg"
+                    ),
                 })
+                sound_direction = voice_message.get("sound_direction_deg")
+                if (
+                    selected_track_id is None
+                    and not movement_enabled
+                    and sound_direction is not None
+                    and voice_command not in {
+                        "stop",
+                        "lie_down",
+                        "stop_and_lie_down",
+                    }
+                ):
+                    attention_yaw = sound_direction_to_head_yaw(
+                        sound_direction
+                    )
+                    if attention_yaw is None:
+                        print(
+                            "[ATTENTION] speaker detected in rear sector at "
+                            f"{sound_direction}deg; head-only turn skipped"
+                        )
+                    elif command_head(
+                        robot_session,
+                        args.robot_api,
+                        attention_yaw,
+                        0.0,
+                    ):
+                        yaw = attention_yaw
+                        pitch = 0.0
+                        head_reference_known = True
+                        print(
+                            "[ATTENTION] no person selected; looking toward "
+                            f"speaker bearing {float(sound_direction):.0f}deg "
+                            f"with head yaw {attention_yaw:+.0f}deg"
+                        )
                 if voice_command in {
                     "stop",
                     "lie_down",
