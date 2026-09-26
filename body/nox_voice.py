@@ -250,6 +250,24 @@ def daemon_json(host: str, port: int, payload: dict) -> dict:
     return json.loads(response) if response else {"ok": False, "error": "empty reply"}
 
 
+def read_sound_direction(args: argparse.Namespace) -> float | None:
+    """Consume the latest sound-bearing event before acknowledgement audio."""
+    try:
+        result = daemon_json(
+            args.daemon_host,
+            args.daemon_port,
+            {"cmd": "ears"},
+        )
+        if not result.get("detected"):
+            return None
+        direction = float(result.get("direction_deg"))
+        if 0.0 <= direction < 360.0:
+            return round(direction, 1)
+    except Exception as exc:
+        print(f"[voice] Sound-direction read failed: {exc}", flush=True)
+    return None
+
+
 def run_local_action(args: argparse.Namespace, command: str) -> tuple[str | None, dict]:
     if command == "stop":
         daemon_command = {"cmd": "halt", "speed": 40}
@@ -312,6 +330,7 @@ def relay_command(
     confidence: float | None,
     local_action: str | None,
     local_result: dict,
+    sound_direction_deg: float | None,
 ) -> bool:
     payload = {
         "text": text,
@@ -322,6 +341,8 @@ def relay_command(
     }
     if confidence is not None:
         payload["confidence"] = confidence
+    if sound_direction_deg is not None:
+        payload["sound_direction_deg"] = sound_direction_deg
     try:
         response = http_json(
             "POST",
@@ -339,6 +360,7 @@ def relay_conversation(
     text: str,
     confidence: float | None,
     audio: bytes,
+    sound_direction_deg: float | None,
 ) -> bool:
     """Relay one wake-word utterance and its PCM audio for desktop Whisper."""
     payload = {
@@ -352,6 +374,8 @@ def relay_conversation(
     }
     if confidence is not None:
         payload["confidence"] = confidence
+    if sound_direction_deg is not None:
+        payload["sound_direction_deg"] = sound_direction_deg
     try:
         response = http_json(
             "POST",
@@ -504,11 +528,13 @@ def main() -> int:
                     continue
                 last_command = text
                 last_command_time = now
+                sound_direction = read_sound_direction(args)
                 relayed = relay_conversation(
                     args,
                     text,
                     confidence,
                     audio,
+                    sound_direction,
                 )
                 bark_ack = (
                     acknowledge_command(args, "conversation")
@@ -518,6 +544,7 @@ def main() -> int:
                 print(
                     f"[voice] ACCEPTED conversation: text={text!r} "
                     f"confidence={confidence} audio_bytes={len(audio)} "
+                    f"sound_direction={sound_direction} "
                     f"desktop_relay={relayed} bark_ack={bark_ack}",
                     flush=True,
                 )
@@ -544,6 +571,9 @@ def main() -> int:
             last_command = command
             last_command_time = now
 
+            sound_direction = (
+                read_sound_direction(args) if has_wake_word else None
+            )
             local_action, local_result = run_local_action(args, command)
             relayed = relay_command(
                 args,
@@ -552,6 +582,7 @@ def main() -> int:
                 confidence,
                 local_action,
                 local_result,
+                sound_direction,
             )
             local_accepted = (
                 local_action is None
@@ -571,6 +602,7 @@ def main() -> int:
             print(
                 f"[voice] ACCEPTED {command}: text={text!r} "
                 f"confidence={confidence} local_ok={local_result.get('ok')} "
+                f"sound_direction={sound_direction} "
                 f"desktop_relay={relayed} bark_ack={bark_ack}",
                 flush=True,
             )
