@@ -27,7 +27,11 @@ Controls:
 from __future__ import annotations
 
 import argparse
+import base64
 import json
+import os
+import subprocess
+import tempfile
 
 try:
     import av
@@ -710,17 +714,85 @@ class VLMObserver:
             print(f"\nVLM error: {message}\n")
 
 
+def synthesize_windows_speech(text: str) -> bytes:
+    """Render offline Windows SAPI speech to a PCM WAV on the desktop."""
+    if os.name != "nt":
+        raise RuntimeError(
+            "Desktop TTS currently requires Windows System.Speech"
+        )
+
+    powershell = r"""
+Add-Type -AssemblyName System.Speech
+$textPath = $args[0]
+$wavPath = $args[1]
+$synth = New-Object System.Speech.Synthesis.SpeechSynthesizer
+try {
+    $synth.Rate = 1
+    $synth.SetOutputToWaveFile($wavPath)
+    $text = [System.IO.File]::ReadAllText(
+        $textPath,
+        [System.Text.Encoding]::UTF8
+    )
+    $synth.Speak($text)
+}
+finally {
+    $synth.Dispose()
+}
+"""
+    with tempfile.TemporaryDirectory(prefix="pidog_tts_") as directory:
+        text_path = Path(directory) / "speech.txt"
+        wav_path = Path(directory) / "speech.wav"
+        text_path.write_text(text, encoding="utf-8")
+        completed = subprocess.run(
+            [
+                "powershell.exe",
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                powershell,
+                str(text_path),
+                str(wav_path),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        if completed.returncode != 0:
+            detail = completed.stderr.strip() or completed.stdout.strip()
+            raise RuntimeError(f"Windows speech synthesis failed: {detail}")
+        if not wav_path.exists():
+            raise RuntimeError("Windows speech synthesis produced no WAV file")
+        audio = wav_path.read_bytes()
+
+    if len(audio) < 44 or audio[:4] != b"RIFF" or audio[8:12] != b"WAVE":
+        raise RuntimeError("Windows speech synthesis returned an invalid WAV")
+    return audio
+
+
 def speak_robot(robot_api: str, text: str) -> None:
-    """Send completed VLM text to PiDog's asynchronous speech endpoint."""
+    """Synthesize speech on the desktop and upload only the WAV to PiDog."""
+    started = time.perf_counter()
+    audio = synthesize_windows_speech(text)
+    synthesis_seconds = time.perf_counter() - started
+
     response = requests.post(
-        f"{robot_api.rstrip('/')}/speak",
-        json={"text": text, "blocking": False},
-        timeout=(0.5, 4.0),
+        f"{robot_api.rstrip('/')}/audio/play",
+        json={"audio_b64": base64.b64encode(audio).decode("ascii")},
+        timeout=(1.0, 15.0),
     )
     response.raise_for_status()
     payload = response.json()
     if payload.get("error") or payload.get("ok") is False:
         raise RuntimeError(str(payload))
+    print(
+        f"[TTS] desktop synthesis {synthesis_seconds:.2f}s | "
+        f"{len(audio) / 1024:.0f} KiB uploaded | "
+        f"audio {payload.get('duration_s', '?')}s"
+    )
 
 
 def command_head(
