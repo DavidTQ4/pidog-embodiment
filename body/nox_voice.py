@@ -474,7 +474,9 @@ def main() -> int:
     last_echo_check = 0.0
     suppress_echo = False
     utterance_audio = bytearray()
-    max_utterance_bytes = SAMPLE_RATE * 2 * 20
+    # Retain enough PCM for a normal conversational request without relaying
+    # startup silence or many seconds of stale room noise to desktop ASR.
+    relay_audio_window_bytes = SAMPLE_RATE * 2 * 10
 
     try:
         while not stopping:
@@ -497,12 +499,8 @@ def main() -> int:
 
             chunk = apply_gain(chunk, args.gain)
             utterance_audio.extend(chunk)
-            if len(utterance_audio) > max_utterance_bytes:
-                print("[voice] Discarded utterance longer than 20 seconds", flush=True)
-                recognizer.Reset()
-                command_recognizer.Reset()
-                utterance_audio.clear()
-                continue
+            if len(utterance_audio) > relay_audio_window_bytes:
+                del utterance_audio[:-relay_audio_window_bytes]
 
             speech_complete = recognizer.AcceptWaveform(chunk)
             command_complete = command_recognizer.AcceptWaveform(chunk)
