@@ -75,7 +75,7 @@ def _find_piper():
     return shutil.which("piper") or local
 
 PIPER_BIN = os.environ.get("PIPER_BIN") or _find_piper()
-PIPER_MODEL = os.environ.get("PIPER_MODEL") or os.path.expanduser("~/.local/share/piper-voices/de_DE-thorsten-high.onnx")
+PIPER_MODEL = os.environ.get("PIPER_MODEL") or os.path.expanduser("~/.local/share/piper-voices/en_GB-alan-medium.onnx")
 SOUNDS_DIR = os.path.expanduser("~/pidog/sounds")
 
 # ─── Ultrasonic distance sensor (separate from PiDog to avoid Process hang) ───
