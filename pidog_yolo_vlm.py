@@ -111,6 +111,9 @@ CENTRE_AIM_FRACTION = 0.50
 UPPER_BODY_AIM_FRACTION = 0.20
 FACE_KEYPOINT_CONFIDENCE = 0.35
 MIN_POSE_BOX_IOU = 0.25
+# Keep acoustic bearing telemetry, but do not steer the head from it.
+# Visual person tracking remains the only automatic source of head movement.
+SOUND_ATTENTION_ENABLED = False
 SOUND_ATTENTION_DEADBAND_DEGREES = 4.0
 SOUND_ATTENTION_CORRECTION_GAIN = 0.80
 
@@ -2811,7 +2814,8 @@ def main() -> None:
                 })
                 sound_direction = voice_message.get("sound_direction_deg")
                 if (
-                    selected_track_id is None
+                    SOUND_ATTENTION_ENABLED
+                    and selected_track_id is None
                     and not movement_enabled
                     and sound_direction is not None
                     and voice_command not in {
