@@ -111,6 +111,7 @@ CENTRE_AIM_FRACTION = 0.50
 UPPER_BODY_AIM_FRACTION = 0.20
 FACE_KEYPOINT_CONFIDENCE = 0.35
 MIN_POSE_BOX_IOU = 0.25
+SOUND_ATTENTION_DEADBAND_DEGREES = 4.0
 
 
 class LatestFrameCamera:
@@ -2821,20 +2822,43 @@ def main() -> None:
                             "[ATTENTION] speaker detected in rear sector at "
                             f"{sound_direction}deg; head-only turn skipped"
                         )
-                    elif command_head(
-                        robot_session,
-                        args.robot_api,
-                        attention_yaw,
-                        0.0,
-                    ):
-                        yaw = attention_yaw
-                        pitch = 0.0
-                        head_reference_known = True
-                        print(
-                            "[ATTENTION] no person selected; looking toward "
-                            f"speaker bearing {float(sound_direction):.0f}deg "
-                            f"with head yaw {attention_yaw:+.0f}deg"
-                        )
+                    else:
+                        current_yaw = yaw
+                        yaw_correction = attention_yaw - current_yaw
+                        if (
+                            abs(yaw_correction)
+                            < SOUND_ATTENTION_DEADBAND_DEGREES
+                        ):
+                            print(
+                                "[ATTENTION] speaker already centred enough | "
+                                f"bearing={float(sound_direction):.0f}deg "
+                                f"current={current_yaw:+.1f}deg "
+                                f"target={attention_yaw:+.1f}deg "
+                                f"delta={yaw_correction:+.1f}deg"
+                            )
+                        elif command_head(
+                            robot_session,
+                            args.robot_api,
+                            current_yaw + yaw_correction,
+                            0.0,
+                        ):
+                            yaw = float(
+                                np.clip(
+                                    current_yaw + yaw_correction,
+                                    YAW_LIMITS[0],
+                                    YAW_LIMITS[1],
+                                )
+                            )
+                            pitch = 0.0
+                            head_reference_known = True
+                            print(
+                                "[ATTENTION] no person selected; aiming from "
+                                "tracked head position | "
+                                f"bearing={float(sound_direction):.0f}deg "
+                                f"current={current_yaw:+.1f}deg "
+                                f"target={attention_yaw:+.1f}deg "
+                                f"delta={yaw_correction:+.1f}deg"
+                            )
                 if voice_command in {
                     "stop",
                     "lie_down",
