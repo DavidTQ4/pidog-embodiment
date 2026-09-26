@@ -33,6 +33,9 @@ PHRASE_TO_COMMAND = {
     "arm head": "arm_head",
     "track me": "arm_head",
     "follow me": "follow_me",
+    "what do you see": "describe_scene",
+    "what can you see": "describe_scene",
+    "tell me what you see": "describe_scene",
 
     # Safety and posture.
     "stop": "stop",
@@ -428,7 +431,7 @@ def main() -> int:
                 # separately from "Nox arm head". These fragments have no
                 # command authority and do not need to flood the journal.
                 harmless_fragments = {
-                    "fluffy", "head", "arm", "track", "me"
+                    "fluffy", "head", "arm", "track", "me", "what", "see"
                 }
                 if text and text != "[unk]" and text not in harmless_fragments:
                     print(f"[voice] Ignored: {text!r}", flush=True)

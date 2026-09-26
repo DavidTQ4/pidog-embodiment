@@ -65,11 +65,14 @@ DEFAULT_VLM_MODEL = "Qwen/Qwen3-VL-4B-Instruct"
 DEFAULT_YOLO_MODEL = "yolo11n.pt"
 DEFAULT_POSE_MODEL = "yolo11n-pose.pt"
 DEFAULT_PROMPT = (
-    "Describe the scene from the robot dog's viewpoint. Use the supplied YOLO "
-    "tracks as fallible hints and check them against the image. Identify the "
-    "most relevant visible subject, give its YOLO track_id if one applies, "
-    "describe its relative position, and mention immediate obstacles or hazards. "
-    "Do not invent a track ID and do not issue movement commands. Be concise."
+    "You are Fluffy, a robot dog. Describe what you can currently see from "
+    "your own first-person viewpoint, using natural spoken English. Use the "
+    "supplied YOLO tracks as fallible hints and check them against the image. "
+    "Mention the most relevant people, objects, activity, and any immediate "
+    "obstacles or hazards. If useful, identify an operator-selected person by "
+    "name, but do not speak YOLO track IDs or technical metadata. Do not issue "
+    "movement commands. Respond with plain text in two to four concise "
+    "sentences suitable for speaking aloud."
 )
 
 # Conservative person-tracking controller. The VLM never supplies angles.
@@ -610,6 +613,7 @@ class VLMObserver:
         frame: np.ndarray,
         detections: list[Detection],
         prompt: str,
+        on_complete=None,
     ) -> bool:
         with self.lock:
             if self.state.running:
@@ -622,7 +626,7 @@ class VLMObserver:
 
         threading.Thread(
             target=self._analyse,
-            args=(frame.copy(), list(detections), prompt),
+            args=(frame.copy(), list(detections), prompt, on_complete),
             daemon=True,
         ).start()
         return True
@@ -632,6 +636,7 @@ class VLMObserver:
         bgr_frame: np.ndarray,
         detections: list[Detection],
         prompt: str,
+        on_complete=None,
     ) -> None:
         started = time.perf_counter()
         try:
@@ -686,6 +691,14 @@ class VLMObserver:
                 f"\nVLM ({seconds:.2f}s, {len(detections)} YOLO tracks):\n"
                 f"{result}\n"
             )
+            if on_complete is not None and result:
+                try:
+                    on_complete(result)
+                except Exception as callback_error:
+                    print(
+                        "VLM result callback failed: "
+                        f"{type(callback_error).__name__}: {callback_error}"
+                    )
         except Exception as exc:
             seconds = time.perf_counter() - started
             message = f"{type(exc).__name__}: {exc}"
@@ -695,6 +708,19 @@ class VLMObserver:
                 self.state.error = message
                 self.state.running = False
             print(f"\nVLM error: {message}\n")
+
+
+def speak_robot(robot_api: str, text: str) -> None:
+    """Send completed VLM text to PiDog's asynchronous speech endpoint."""
+    response = requests.post(
+        f"{robot_api.rstrip('/')}/speak",
+        json={"text": text, "blocking": False},
+        timeout=(0.5, 4.0),
+    )
+    response.raise_for_status()
+    payload = response.json()
+    if payload.get("error") or payload.get("ok") is False:
+        raise RuntimeError(str(payload))
 
 
 def command_head(
@@ -805,6 +831,9 @@ VOICE_COMMANDS = {
     "arm head": "arm_head",
     "track me": "arm_head",
     "follow me": "follow_me",
+    "what do you see": "describe_scene",
+    "what can you see": "describe_scene",
+    "tell me what you see": "describe_scene",
     "stop": "stop",
     "halt": "stop",
     "lie down": "lie_down",
@@ -822,6 +851,7 @@ def voice_message_command(message: dict[str, object]) -> str | None:
         "select_me",
         "arm_head",
         "follow_me",
+        "describe_scene",
         "stop",
         "lie_down",
         "stop_and_lie_down",
@@ -831,7 +861,7 @@ def voice_message_command(message: dict[str, object]) -> str | None:
     if not isinstance(text, str):
         return None
     words = text.lower().strip().split()
-    if words and words[0] in {"nox", "knox", "knocks"}:
+    if words and words[0] in {"fluffy", "nox", "knox", "knocks"}:
         words = words[1:]
     return VOICE_COMMANDS.get(" ".join(words))
 
@@ -1373,7 +1403,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--face-model-directory", default="face_models")
     parser.add_argument("--prompt", default=DEFAULT_PROMPT)
-    parser.add_argument("--max-new-tokens", type=int, default=160)
+    parser.add_argument(
+        "--max-new-tokens",
+        type=int,
+        default=220,
+        help="Maximum VLM response tokens; 220 allows concise busy-scene summaries.",
+    )
     parser.add_argument("--confidence", type=float, default=0.35)
     parser.add_argument("--pose-confidence", type=float, default=0.35)
     parser.add_argument(
@@ -1620,7 +1655,7 @@ def main() -> None:
         voice_poller.start()
         print(
             "Voice commands enabled asynchronously: select me | arm head | "
-            "follow me | stop | lie down"
+            "follow me | what do you see | stop | lie down"
         )
     try:
         deadline = time.monotonic() + 15
@@ -2452,6 +2487,7 @@ def main() -> None:
             # them here disarms the desktop controller so it cannot admit
             # another gait.
             voice_now = time.perf_counter()
+            speak_analysis_result = False
             if voice_poller is not None:
                 new_voice_commands, voice_error = voice_poller.drain()
                 voice_command_queue.extend(new_voice_commands)
@@ -2487,6 +2523,13 @@ def main() -> None:
                     print(
                         f"Voice {voice_command}: head/body following DISARMED; "
                         f"local posture action {local_status}"
+                    )
+                elif key == 255 and voice_command == "describe_scene":
+                    speak_analysis_result = True
+                    key = ord("v")
+                    print(
+                        "Voice scene request accepted: analysing the newest "
+                        "camera frame and preparing a spoken response"
                     )
                 elif key == 255 and voice_command == "select_me":
                     people = selectable_people(yolo_state.detections)
@@ -2759,10 +2802,16 @@ def main() -> None:
                             f"identity {selected_identity or 'unknown'}."
                         )
                     )
+                    completion_callback = (
+                        (lambda result: speak_robot(args.robot_api, result))
+                        if speak_analysis_result
+                        else None
+                    )
                     if vlm.submit(
                         analysis_frame,
                         analysis_detections,
                         f"{args.prompt}\n{selected_context}",
+                        on_complete=completion_callback,
                     ):
                         print(
                             "VLM analysis started with "
@@ -2770,6 +2819,14 @@ def main() -> None:
                         )
                     else:
                         print("VLM inference already running; request ignored")
+                        if speak_analysis_result:
+                            try:
+                                speak_robot(
+                                    args.robot_api,
+                                    "I am still looking at the previous scene.",
+                                )
+                            except Exception as exc:
+                                print(f"Could not speak busy response: {exc}")
     finally:
         if voice_poller is not None:
             voice_poller.stop()
