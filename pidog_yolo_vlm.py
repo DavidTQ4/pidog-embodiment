@@ -112,6 +112,7 @@ UPPER_BODY_AIM_FRACTION = 0.20
 FACE_KEYPOINT_CONFIDENCE = 0.35
 MIN_POSE_BOX_IOU = 0.25
 SOUND_ATTENTION_DEADBAND_DEGREES = 4.0
+SOUND_ATTENTION_CORRECTION_GAIN = 0.80
 
 
 class LatestFrameCamera:
@@ -2824,9 +2825,13 @@ def main() -> None:
                         )
                     else:
                         current_yaw = yaw
-                        yaw_correction = attention_yaw - current_yaw
+                        raw_yaw_correction = attention_yaw - current_yaw
+                        applied_yaw_correction = (
+                            raw_yaw_correction
+                            * SOUND_ATTENTION_CORRECTION_GAIN
+                        )
                         if (
-                            abs(yaw_correction)
+                            abs(raw_yaw_correction)
                             < SOUND_ATTENTION_DEADBAND_DEGREES
                         ):
                             print(
@@ -2834,17 +2839,17 @@ def main() -> None:
                                 f"bearing={float(sound_direction):.0f}deg "
                                 f"current={current_yaw:+.1f}deg "
                                 f"target={attention_yaw:+.1f}deg "
-                                f"delta={yaw_correction:+.1f}deg"
+                                f"delta={raw_yaw_correction:+.1f}deg"
                             )
                         elif command_head(
                             robot_session,
                             args.robot_api,
-                            current_yaw + yaw_correction,
+                            current_yaw + applied_yaw_correction,
                             0.0,
                         ):
                             yaw = float(
                                 np.clip(
-                                    current_yaw + yaw_correction,
+                                    current_yaw + applied_yaw_correction,
                                     YAW_LIMITS[0],
                                     YAW_LIMITS[1],
                                 )
@@ -2857,7 +2862,8 @@ def main() -> None:
                                 f"bearing={float(sound_direction):.0f}deg "
                                 f"current={current_yaw:+.1f}deg "
                                 f"target={attention_yaw:+.1f}deg "
-                                f"delta={yaw_correction:+.1f}deg"
+                                f"raw_delta={raw_yaw_correction:+.1f}deg "
+                                f"applied={applied_yaw_correction:+.1f}deg"
                             )
                 if voice_command in {
                     "stop",
