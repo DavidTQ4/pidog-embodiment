@@ -134,6 +134,7 @@ class LatestFrameCamera:
         self.error: str | None = None
         self.lock = threading.Lock()
         self.stop_event = threading.Event()
+        self.reconnect_event = threading.Event()
         self.thread = threading.Thread(target=self._run, daemon=True)
 
     def start(self) -> None:
@@ -142,6 +143,11 @@ class LatestFrameCamera:
     def stop(self) -> None:
         self.stop_event.set()
         self.thread.join(timeout=3)
+
+    def reconnect(self) -> None:
+        """Drop the current H.264 TCP session and start from a fresh stream."""
+        if self.url.lower().startswith("tcp://"):
+            self.reconnect_event.set()
 
     def latest(self) -> tuple[int, np.ndarray | None, str | None]:
         with self.lock:
@@ -205,6 +211,11 @@ class LatestFrameCamera:
                     self.error = None
                 for decoded in container.decode(video=0):
                     if self.stop_event.is_set():
+                        break
+                    if self.reconnect_event.is_set():
+                        self.reconnect_event.clear()
+                        with self.lock:
+                            self.error = "Discarding queued H.264 data; reconnecting"
                         break
                     frame = decoded.to_ndarray(format="bgr24")
                     with self.lock:
@@ -1904,7 +1915,7 @@ def main() -> None:
         "1-9: select person | 0: clear | C: centre | M: head arm/disarm | "
         "T: identity body-follow arm/disarm | "
         "A: fallback aim | H: head aim | V/Space: VLM | Y: YOLO on/off | "
-        "Q/Esc: quit"
+        "R: refresh video | Q/Esc: quit"
     )
     if args.disable_voice_commands:
         print("Pi voice-command polling disabled")
@@ -2617,7 +2628,7 @@ def main() -> None:
                 f"{len(yolo_state.detections)} tracks | "
                 f"detect {yolo_state.inference_ms:.0f} ms | "
                 f"pose {pose_state.inference_ms:.0f} ms | "
-                f"{display_fps:.1f} FPS"
+                f"camera {display_fps:.1f} FPS"
             )
             cv2.putText(
                 display_frame,
@@ -2905,6 +2916,13 @@ def main() -> None:
 
             if key in (ord("q"), 27):
                 break
+            if key == ord("r"):
+                camera.reconnect()
+                print(
+                    "[CAMERA] reconnect requested; discarding any queued "
+                    "H.264 video"
+                )
+                key = 255
             if key == ord("y"):
                 yolo_enabled = not yolo_enabled
                 if not yolo_enabled:
