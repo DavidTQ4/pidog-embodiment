@@ -10,6 +10,7 @@ for a spoken stop.
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import os
 import signal
@@ -26,18 +27,61 @@ from vosk import KaldiRecognizer, Model, SetLogLevel
 
 
 SAMPLE_RATE = 16000
-WAKE_WORDS = ("nox", "knox", "knocks")
+WAKE_WORDS = ("fluffy",)
 PHRASE_TO_COMMAND = {
+    # Desktop-assisted identity tracking.
     "select me": "select_me",
     "arm head": "arm_head",
     "track me": "arm_head",
     "follow me": "follow_me",
+    "what do you see": "describe_scene",
+    "what can you see": "describe_scene",
+    "tell me what you see": "describe_scene",
+
+    # Safety and posture.
     "stop": "stop",
     "emergency stop": "stop",
+    "sit": "sit",
+    "sit down": "sit",
+    "stand": "stand",
+    "stand up": "stand",
     "lie down": "lie_down",
     "lay down": "lie_down",
     "stop and lie down": "stop_and_lie_down",
     "stop and lay down": "stop_and_lie_down",
+    "go to sleep": "doze_off",
+
+    # Local social actions and tricks.
+    "paw": "hand_shake",
+    "give me your paw": "hand_shake",
+    "shake paws": "hand_shake",
+    "high five": "high_five",
+    "bark": "bark",
+    "howl": "howling",
+    "wag your tail": "wag_tail",
+    "wag tail": "wag_tail",
+    "stretch": "stretch",
+    "scratch": "scratch",
+    "pant": "pant",
+    "nod": "nod",
+    "shake your head": "shake_head",
+    "shake head": "shake_head",
+}
+
+LOCAL_MOVE_ACTIONS = {
+    "sit": ("sit", 60),
+    "stand": ("stand", 60),
+    "doze_off": ("doze_off", 70),
+    "hand_shake": ("hand_shake", 70),
+    "high_five": ("high_five", 70),
+    "bark": ("bark", 70),
+    "howling": ("howling", 70),
+    "wag_tail": ("wag_tail", 80),
+    "stretch": ("stretch", 70),
+    "scratch": ("scratch", 70),
+    "pant": ("pant", 70),
+    "nod": ("nod", 70),
+    "shake_head": ("shake_head", 70),
 }
 
 
@@ -80,7 +124,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--stop-without-wake",
         action=argparse.BooleanOptionalAction,
-        default=os.environ.get("NOX_STOP_WITHOUT_WAKE", "1") != "0",
+        default=os.environ.get("NOX_STOP_WITHOUT_WAKE", "0") != "0",
         help="Accept bare 'stop' as a fail-safe.",
     )
     parser.add_argument(
@@ -88,6 +132,12 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=float(os.environ.get("NOX_VOICE_MIN_CONFIDENCE", "0.60")),
         help="Minimum mean Vosk confidence for wake-word commands.",
+    )
+    parser.add_argument(
+        "--bark-ack",
+        action=argparse.BooleanOptionalAction,
+        default=os.environ.get("NOX_VOICE_BARK_ACK", "1") != "0",
+        help="Acknowledge accepted commands with the short single_bark_1 sound.",
     )
     parser.add_argument(
         "--bare-stop-minimum-confidence",
@@ -200,11 +250,37 @@ def daemon_json(host: str, port: int, payload: dict) -> dict:
     return json.loads(response) if response else {"ok": False, "error": "empty reply"}
 
 
+def read_sound_direction(args: argparse.Namespace) -> float | None:
+    """Consume the latest sound-bearing event before acknowledgement audio."""
+    try:
+        result = daemon_json(
+            args.daemon_host,
+            args.daemon_port,
+            {"cmd": "ears"},
+        )
+        if not result.get("detected"):
+            return None
+        direction = float(result.get("direction_deg"))
+        if 0.0 <= direction < 360.0:
+            return round(direction, 1)
+    except Exception as exc:
+        print(f"[voice] Sound-direction read failed: {exc}", flush=True)
+    return None
+
+
 def run_local_action(args: argparse.Namespace, command: str) -> tuple[str | None, dict]:
     if command == "stop":
         daemon_command = {"cmd": "halt", "speed": 40}
     elif command in {"lie_down", "stop_and_lie_down"}:
         daemon_command = {"cmd": "lie_down", "speed": 40}
+    elif command in LOCAL_MOVE_ACTIONS:
+        action, speed = LOCAL_MOVE_ACTIONS[command]
+        daemon_command = {
+            "cmd": "move_if_idle",
+            "action": action,
+            "steps": 1,
+            "speed": speed,
+        }
     else:
         return None, {"ok": True, "not_local": True}
 
@@ -231,6 +307,22 @@ def run_local_action(args: argparse.Namespace, command: str) -> tuple[str | None
             }
 
 
+def acknowledge_command(args: argparse.Namespace, command: str) -> bool:
+    """Play a short speaker bark without adding a physical movement."""
+    if not args.bark_ack or command == "bark":
+        return True
+    try:
+        result = daemon_json(
+            args.daemon_host,
+            args.daemon_port,
+            {"cmd": "sound", "name": "single_bark_1"},
+        )
+        return bool(result.get("ok"))
+    except Exception as exc:
+        print(f"[voice] Bark acknowledgement failed: {exc}", flush=True)
+        return False
+
+
 def relay_command(
     args: argparse.Namespace,
     text: str,
@@ -238,6 +330,7 @@ def relay_command(
     confidence: float | None,
     local_action: str | None,
     local_result: dict,
+    sound_direction_deg: float | None,
 ) -> bool:
     payload = {
         "text": text,
@@ -248,6 +341,8 @@ def relay_command(
     }
     if confidence is not None:
         payload["confidence"] = confidence
+    if sound_direction_deg is not None:
+        payload["sound_direction_deg"] = sound_direction_deg
     try:
         response = http_json(
             "POST",
@@ -257,6 +352,40 @@ def relay_command(
         return bool(response.get("ok"))
     except Exception as exc:
         print(f"[voice] Could not relay {command} to desktop inbox: {exc}", flush=True)
+        return False
+
+
+def relay_conversation(
+    args: argparse.Namespace,
+    text: str,
+    confidence: float | None,
+    audio: bytes,
+    sound_direction_deg: float | None,
+) -> bool:
+    """Relay one wake-word utterance and its PCM audio for desktop Whisper."""
+    payload = {
+        "text": text,
+        "source": "pidog_vosk_conversation",
+        "command": "conversation",
+        "audio_b64": base64.b64encode(audio).decode("ascii"),
+        "sample_rate": SAMPLE_RATE,
+        "sample_width": 2,
+        "channels": 1,
+    }
+    if confidence is not None:
+        payload["confidence"] = confidence
+    if sound_direction_deg is not None:
+        payload["sound_direction_deg"] = sound_direction_deg
+    try:
+        response = http_json(
+            "POST",
+            f"{args.bridge.rstrip('/')}/voice/input",
+            payload,
+            timeout=5.0,
+        )
+        return bool(response.get("ok"))
+    except Exception as exc:
+        print(f"[voice] Could not relay conversation audio: {exc}", flush=True)
         return False
 
 
@@ -289,8 +418,9 @@ def main() -> int:
     SetLogLevel(-1)
     print(f"[voice] Loading Vosk model: {model_path}", flush=True)
     model = Model(str(model_path))
-    grammar = grammar_phrases(args.stop_without_wake)
-    recognizer = KaldiRecognizer(model, SAMPLE_RATE, json.dumps(grammar))
+    # Unrestricted recognition allows wake-word conversation. Exact command
+    # matching and confidence gates below still own all physical actions.
+    recognizer = KaldiRecognizer(model, SAMPLE_RATE)
     recognizer.SetWords(True)
 
     arecord_command = [
@@ -308,7 +438,7 @@ def main() -> int:
         "1",
     ]
     print(
-        f"[voice] Listening on {args.device}; say 'Nox' followed by a command",
+        f"[voice] Listening on {args.device}; say 'Fluffy' followed by a command",
         flush=True,
     )
     if args.stop_without_wake:
@@ -328,6 +458,8 @@ def main() -> int:
     last_command_time = 0.0
     last_echo_check = 0.0
     suppress_echo = False
+    utterance_audio = bytearray()
+    max_utterance_bytes = SAMPLE_RATE * 2 * 20
 
     try:
         while not stopping:
@@ -344,29 +476,80 @@ def main() -> int:
                 last_echo_check = now
             if suppress_echo:
                 recognizer.Reset()
+                utterance_audio.clear()
                 continue
 
             chunk = apply_gain(chunk, args.gain)
+            utterance_audio.extend(chunk)
+            if len(utterance_audio) > max_utterance_bytes:
+                print("[voice] Discarded utterance longer than 20 seconds", flush=True)
+                recognizer.Reset()
+                utterance_audio.clear()
+                continue
             if not recognizer.AcceptWaveform(chunk):
                 continue
 
+            audio = bytes(utterance_audio)
+            utterance_audio.clear()
             result = json.loads(recognizer.Result())
             text = " ".join(result.get("text", "").split())
             command = canonical_command(text, args.stop_without_wake)
-            if command is None:
-                # Vosk often finalises a trailing fragment such as "head"
-                # separately from "Nox arm head". These fragments have no
-                # command authority and do not need to flood the journal.
-                harmless_fragments = {
-                    "nox", "knox", "knocks", "head", "arm", "track", "me"
-                }
-                if text and text != "[unk]" and text not in harmless_fragments:
-                    print(f"[voice] Ignored: {text!r}", flush=True)
-                continue
-
             confidence = result_confidence(result)
             words = text.lower().strip().split()
             has_wake_word = bool(words and words[0] in WAKE_WORDS)
+
+            if command is None:
+                if not has_wake_word:
+                    harmless_fragments = {
+                        "fluffy", "head", "arm", "track", "me", "what", "see"
+                    }
+                    if (
+                        text
+                        and text != "[unk]"
+                        and text not in harmless_fragments
+                    ):
+                        print(f"[voice] Ignored: {text!r}", flush=True)
+                    continue
+                if confidence is None or confidence < args.minimum_confidence:
+                    print(
+                        "[voice] REJECTED low-confidence conversation: "
+                        f"text={text!r} confidence={confidence} "
+                        f"required={args.minimum_confidence:.2f}",
+                        flush=True,
+                    )
+                    continue
+
+                now = time.monotonic()
+                if (
+                    text == last_command
+                    and now - last_command_time < args.debounce_seconds
+                ):
+                    print("[voice] Debounced duplicate conversation", flush=True)
+                    continue
+                last_command = text
+                last_command_time = now
+                sound_direction = read_sound_direction(args)
+                relayed = relay_conversation(
+                    args,
+                    text,
+                    confidence,
+                    audio,
+                    sound_direction,
+                )
+                bark_ack = (
+                    acknowledge_command(args, "conversation")
+                    if relayed
+                    else False
+                )
+                print(
+                    f"[voice] ACCEPTED conversation: text={text!r} "
+                    f"confidence={confidence} audio_bytes={len(audio)} "
+                    f"sound_direction={sound_direction} "
+                    f"desktop_relay={relayed} bark_ack={bark_ack}",
+                    flush=True,
+                )
+                continue
+
             minimum_confidence = (
                 args.minimum_confidence
                 if has_wake_word
@@ -388,6 +571,9 @@ def main() -> int:
             last_command = command
             last_command_time = now
 
+            sound_direction = (
+                read_sound_direction(args) if has_wake_word else None
+            )
             local_action, local_result = run_local_action(args, command)
             relayed = relay_command(
                 args,
@@ -396,11 +582,28 @@ def main() -> int:
                 confidence,
                 local_action,
                 local_result,
+                sound_direction,
+            )
+            local_accepted = (
+                local_action is None
+                or (
+                    bool(local_result.get("ok"))
+                    and bool(local_result.get("accepted", True))
+                )
+            )
+            command_accepted = (
+                relayed if local_action is None else local_accepted
+            )
+            bark_ack = (
+                acknowledge_command(args, command)
+                if command_accepted
+                else False
             )
             print(
                 f"[voice] ACCEPTED {command}: text={text!r} "
                 f"confidence={confidence} local_ok={local_result.get('ok')} "
-                f"desktop_relay={relayed}",
+                f"sound_direction={sound_direction} "
+                f"desktop_relay={relayed} bark_ack={bark_ack}",
                 flush=True,
             )
     finally:

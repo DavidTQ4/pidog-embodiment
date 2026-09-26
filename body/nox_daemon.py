@@ -16,27 +16,52 @@ import traceback
 import math
 from pathlib import Path
 
-# Audio config for HifiBerry DAC (auto-detect card number)
+# Audio output is selected by stable ALSA card ID, not its boot-dependent
+# numeric index. PiDog V2 commonly exposes the speaker as a Google Voice HAT.
 os.environ["SDL_AUDIODRIVER"] = "alsa"
 
-def _find_hifiberry_card():
-    """Auto-detect HifiBerry DAC ALSA card number."""
+def _find_playback_device():
+    """Detect the robot speaker using stable ALSA identifiers."""
+    import re
     import subprocess as _sp
-    try:
-        result = _sp.run(["aplay", "-l"], capture_output=True, text=True, timeout=5)
-        for line in result.stdout.splitlines():
-            if "hifiberry" in line.lower() and "card" in line.lower():
-                card = line.split("card ")[1].split(":")[0]
-                print(f"[nox] HifiBerry DAC found at card {card}", flush=True)
-                return f"plughw:{card},0"
-    except Exception as e:
-        print(f"[nox] HifiBerry detection error: {e}", flush=True)
-    # Fallback: try card 3 (typical Pi 4 with HifiBerry)
-    print("[nox] HifiBerry not found, falling back to plughw:3,0", flush=True)
-    return "plughw:3,0"
 
-# nox.env may pin AUDIODEV for robots whose speaker isn't auto-detectable
-_PLAYBACK_DEVICE = os.environ.get("AUDIODEV") or _find_hifiberry_card()
+    preferred_ids = (
+        "sndrpigooglevoi",
+        "sndrpihifiberry",
+        "hifiberry",
+        "robothat",
+    )
+    try:
+        result = _sp.run(
+            ["aplay", "-l"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        for line in result.stdout.splitlines():
+            match = re.match(r"card\s+\d+:\s+([^\s]+)\s+\[", line.strip())
+            if not match:
+                continue
+            card_id = match.group(1)
+            lowered = line.lower()
+            if any(candidate in lowered for candidate in preferred_ids):
+                device = f"plughw:CARD={card_id},DEV=0"
+                print(
+                    f"[nox] Robot speaker found: {card_id} -> {device}",
+                    flush=True,
+                )
+                return device
+    except Exception as exc:
+        print(f"[nox] Speaker detection error: {exc}", flush=True)
+
+    # ALSA's configured default is safer than guessing a numeric card, which
+    # can silently route sound to HDMI or the headphone socket after reboot.
+    print("[nox] Robot speaker not identified; using ALSA default", flush=True)
+    return "default"
+
+# nox.env may pin AUDIODEV for robots whose speaker isn't auto-detectable.
+_PLAYBACK_DEVICE = os.environ.get("AUDIODEV") or _find_playback_device()
 os.environ["AUDIODEV"] = _PLAYBACK_DEVICE
 
 SOCKET_PATH = "/tmp/nox.sock"
@@ -50,8 +75,15 @@ def _find_piper():
     return shutil.which("piper") or local
 
 PIPER_BIN = os.environ.get("PIPER_BIN") or _find_piper()
-PIPER_MODEL = os.environ.get("PIPER_MODEL") or os.path.expanduser("~/.local/share/piper-voices/de_DE-thorsten-high.onnx")
+PIPER_MODEL = os.environ.get("PIPER_MODEL") or os.path.expanduser("~/.local/share/piper-voices/en_GB-alan-medium.onnx")
 SOUNDS_DIR = os.path.expanduser("~/pidog/sounds")
+
+# Desktop-generated speech playback. Only bridge-created WAVs in /tmp are
+# accepted. A new description interrupts any older one instead of queueing
+# stale scene reports.
+_audio_playback_lock = threading.Lock()
+_audio_playback_generation = 0
+_audio_playback_process = None
 
 # ─── Ultrasonic distance sensor (separate from PiDog to avoid Process hang) ───
 ultrasonic = None
@@ -881,6 +913,128 @@ def cmd_photo(path=None):
     return {"ok": False, "error": f"photo file not created: {actual}"}
 
 
+def cmd_play_audio(path):
+    """Play one bridge-created WAV; the newest request replaces the previous."""
+    global _audio_playback_generation, _audio_playback_process
+
+    try:
+        audio_path = Path(path).resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        return {"ok": False, "error": f"audio file unavailable: {exc}"}
+
+    if (
+        audio_path.parent != Path("/tmp")
+        or not audio_path.name.startswith("nox_desktop_tts_")
+        or audio_path.suffix.lower() != ".wav"
+    ):
+        return {"ok": False, "error": "audio path is not an authorised bridge WAV"}
+
+    try:
+        size = audio_path.stat().st_size
+        header = audio_path.read_bytes()[:12]
+    except OSError as exc:
+        return {"ok": False, "error": f"cannot inspect audio file: {exc}"}
+    if size < 44 or size > 8 * 1024 * 1024:
+        return {"ok": False, "error": f"audio size outside permitted range: {size}"}
+    if header[:4] != b"RIFF" or header[8:12] != b"WAVE":
+        return {"ok": False, "error": "audio file is not RIFF/WAVE"}
+
+    with _audio_playback_lock:
+        _audio_playback_generation += 1
+        generation = _audio_playback_generation
+        previous = _audio_playback_process
+        if previous is not None and previous.poll() is None:
+            previous.terminate()
+        # PiDog initialises pygame on the Voice HAT and may hold the ALSA
+        # device exclusively. Stop any older pygame speech before replacing it.
+        try:
+            import pygame
+            pygame.mixer.music.stop()
+        except Exception:
+            pass
+
+    def _play():
+        global _audio_playback_process
+        import subprocess as sp
+
+        process = None
+        pygame_playback = False
+        try:
+            with _audio_playback_lock:
+                if generation != _audio_playback_generation:
+                    return
+
+            # Use PiDog's existing pygame owner first. Opening a second direct
+            # ALSA client with aplay can fail silently while pygame owns hw:.
+            try:
+                with dog_lock:
+                    if hasattr(dog, "music") and dog.music is not None:
+                        dog.music.sound_play(str(audio_path))
+                        pygame_playback = True
+                if pygame_playback:
+                    print(
+                        f"[nox] desktop TTS playing via pygame: "
+                        f"{audio_path.name}",
+                        flush=True,
+                    )
+                    import pygame
+                    while pygame.mixer.music.get_busy():
+                        with _audio_playback_lock:
+                            if generation != _audio_playback_generation:
+                                pygame.mixer.music.stop()
+                                break
+                        time.sleep(0.05)
+            except Exception as exc:
+                pygame_playback = False
+                print(
+                    f"[nox] desktop TTS pygame failed; trying aplay: {exc}",
+                    flush=True,
+                )
+
+            if not pygame_playback:
+                with _audio_playback_lock:
+                    if generation != _audio_playback_generation:
+                        return
+                    process = sp.Popen(
+                        ["aplay", "-q", "-D", _PLAYBACK_DEVICE, str(audio_path)],
+                        stdout=sp.DEVNULL,
+                        stderr=sp.PIPE,
+                        text=True,
+                    )
+                    _audio_playback_process = process
+                _, stderr = process.communicate(timeout=120)
+                if process.returncode not in (0, -15):
+                    print(
+                        f"[nox] desktop TTS playback failed "
+                        f"({process.returncode}): {stderr.strip()}",
+                        flush=True,
+                    )
+        except sp.TimeoutExpired:
+            if process is not None:
+                process.kill()
+            print("[nox] desktop TTS playback timed out", flush=True)
+        except Exception as exc:
+            print(f"[nox] desktop TTS playback error: {exc}", flush=True)
+        finally:
+            with _audio_playback_lock:
+                if _audio_playback_process is process:
+                    _audio_playback_process = None
+            try:
+                audio_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    threading.Thread(target=_play, daemon=True).start()
+    _mark_activity()
+    return {
+        "ok": True,
+        "accepted": True,
+        "audio": audio_path.name,
+        "bytes": size,
+        "generation": generation,
+    }
+
+
 def cmd_speak(text):
     """TTS via Piper + aplay/PiDog sound_effect. Fully async to avoid TCP timeout."""
     _mark_activity()
@@ -1384,6 +1538,7 @@ COMMANDS = {
     "rgb": lambda args: cmd_rgb(args.get("r", 128), args.get("g", 0), args.get("b", 255), args.get("mode", "breath"), args.get("bps", 0.8)),
     "photo": lambda args: cmd_photo(args.get("path")),
     "speak": lambda args: cmd_speak(args.get("text", "")),
+    "play_audio": lambda args: cmd_play_audio(args.get("path", "")),
     "sound": lambda args: cmd_sound(args.get("name", "single_bark_1")),
     "combo": lambda args: cmd_combo(args.get("sequence", "stand:1:60")),
     "wake": lambda args: cmd_wake(),

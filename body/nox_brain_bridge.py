@@ -16,6 +16,9 @@ import sys
 import json
 import time
 import base64
+import binascii
+import io
+import wave
 import socket
 import threading
 import traceback
@@ -623,7 +626,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
                             "/memory/stats", "/state", "/scan", "/scan/sweep",
                             "/sensors", "/motion/status", "/capabilities",
                             "/vision", "/selftest"],
-                    "POST": ["/action", "/speak", "/command", "/rgb", "/head",
+                    "POST": ["/action", "/speak", "/audio/play", "/command", "/rgb", "/head",
                              "/face/register", "/voice/respond", "/voice/input",
                              "/combo", "/behavior/start", "/behavior/stop",
                              "/emergency_stop", "/keep_awake", "/move",
@@ -728,6 +731,75 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 "results": results,
             })
         
+        elif path == "/audio/play":
+            # Desktop TTS uploads a bounded WAV; the daemon owns playback.
+            encoded = body.get("audio_b64", "")
+            if not isinstance(encoded, str) or not encoded:
+                self._send_json({"ok": False, "error": "audio_b64 is required"}, 400)
+                return
+            if len(encoded) > 11 * 1024 * 1024:
+                self._send_json({"ok": False, "error": "encoded audio exceeds 11 MiB"}, 413)
+                return
+            try:
+                audio_data = base64.b64decode(encoded, validate=True)
+            except (binascii.Error, ValueError) as exc:
+                self._send_json({"ok": False, "error": f"invalid base64 audio: {exc}"}, 400)
+                return
+            if len(audio_data) < 44 or len(audio_data) > 8 * 1024 * 1024:
+                self._send_json({
+                    "ok": False,
+                    "error": f"WAV size outside permitted range: {len(audio_data)}",
+                }, 413)
+                return
+            if audio_data[:4] != b"RIFF" or audio_data[8:12] != b"WAVE":
+                self._send_json({"ok": False, "error": "audio is not RIFF/WAVE"}, 400)
+                return
+            try:
+                with wave.open(io.BytesIO(audio_data), "rb") as wav_file:
+                    frames = wav_file.getnframes()
+                    frame_rate = wav_file.getframerate()
+                    channels = wav_file.getnchannels()
+                    sample_width = wav_file.getsampwidth()
+                    duration = frames / max(frame_rate, 1)
+                if channels not in (1, 2) or sample_width not in (1, 2, 3, 4):
+                    raise ValueError(
+                        f"unsupported WAV layout: {channels} channels, "
+                        f"{sample_width}-byte samples"
+                    )
+                if duration <= 0 or duration > 120:
+                    raise ValueError(f"audio duration outside permitted range: {duration:.1f}s")
+            except (wave.Error, ValueError) as exc:
+                self._send_json({"ok": False, "error": f"invalid WAV: {exc}"}, 400)
+                return
+
+            audio_path = Path(
+                f"/tmp/nox_desktop_tts_{time.time_ns()}.wav"
+            )
+            try:
+                audio_path.write_bytes(audio_data)
+                result = send_to_daemon(
+                    {"cmd": "play_audio", "path": str(audio_path)},
+                    timeout=5,
+                )
+                if result.get("error") or result.get("ok") is False:
+                    audio_path.unlink(missing_ok=True)
+                    self._send_json(result, 503)
+                    return
+                echo_until = time.time() + duration + 1.0
+                with perception.lock:
+                    perception.tts_echo_until = max(
+                        perception.tts_echo_until,
+                        echo_until,
+                    )
+                result.update({
+                    "duration_s": round(duration, 2),
+                    "echo_until": echo_until,
+                })
+                self._send_json(result)
+            except OSError as exc:
+                audio_path.unlink(missing_ok=True)
+                self._send_json({"ok": False, "error": str(exc)}, 500)
+
         elif path == "/speak":
             # Speak text (non-blocking: respond immediately, speak in background)
             text = body.get("text", "")
@@ -855,8 +927,13 @@ class BridgeHandler(BaseHTTPRequestHandler):
                     "command",
                     "confidence",
                     "speaker",
+                    "sound_direction_deg",
                     "local_action",
                     "local_ok",
+                    "audio_b64",
+                    "sample_rate",
+                    "sample_width",
+                    "channels",
                 ):
                     if key in body:
                         msg[key] = body[key]

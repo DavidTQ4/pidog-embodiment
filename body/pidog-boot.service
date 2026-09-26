@@ -1,0 +1,16 @@
+[Unit]
+Description=PiDog local services and default H.264 camera startup
+Wants=network-online.target
+After=network-online.target sound.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/pidog-start
+RemainAfterExit=yes
+Restart=on-failure
+RestartSec=15
+TimeoutStartSec=120
+
+[Install]
+WantedBy=multi-user.target

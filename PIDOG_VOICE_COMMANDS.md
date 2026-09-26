@@ -8,15 +8,24 @@ desktop continues to run YOLO, face identity and movement decisions.
 
 | Spoken phrase | Result |
 | --- | --- |
-| `Nox, select me` | Selects the only recognised visible person. It refuses if none or multiple recognised people are visible. |
-| `Nox, arm head` | Arms head tracking for the selected person. |
-| `Nox, follow me` | Arms identity-locked body following if the selected identity and head tracking are ready. |
-| `Nox, stop` | Locally clears queued walking frames, stabilises in `stand`, and disarms desktop following. |
-| `Nox, lie down` | Locally clears queued walking frames, lies down at controlled speed, and disarms desktop following. |
-| `Nox, stop and lie down` | Same safe controlled lie-down path. |
+| `Fluffy, select me` | Selects the only recognised visible person. It refuses if none or multiple recognised people are visible. |
+| `Fluffy, arm head` | Arms head tracking for the selected person. |
+| `Fluffy, follow me` | Arms identity-locked body following if the selected identity and head tracking are ready. |
+| `Fluffy, stop` | Locally clears queued walking frames, stabilises in `stand`, and disarms desktop following. |
+| `Fluffy, lie down` | Locally clears queued walking frames, lies down at controlled speed, and disarms desktop following. |
+| `Fluffy, stop and lie down` | Same safe controlled lie-down path. |
+| `Fluffy, sit` / `stand up` | Changes posture locally when the legs are idle. |
+| `Fluffy, paw` | Runs the SDK's `hand_shake` action. |
+| `Fluffy, high five` | Runs `high_five` locally. |
+| `Fluffy, bark` / `howl` / `pant` | Runs the corresponding local preset. |
+| `Fluffy, wag your tail` | Runs `wag_tail` locally. |
+| `Fluffy, stretch` / `scratch` | Runs the corresponding local trick. |
+| `Fluffy, nod` / `shake your head` | Runs the corresponding local head action. |
+| `Fluffy, go to sleep` | Runs `doze_off` when the legs are idle. |
 
-Bare `stop` and `halt` are accepted by default. Other commands require the
-`Nox` wake word. Keyboard controls remain available.
+All commands require the `Fluffy` wake word by default, including `stop`. This
+reduces false emergency stops caused by ambient speech. Keyboard controls and
+the ultrasonic emergency halt remain available.
 
 This first version does **speech recognition**, not biometric speaker
 verification. `select me` therefore succeeds only when exactly one recognised
@@ -98,7 +107,7 @@ Expected startup includes:
 
 ```text
 [voice] Loading Vosk model: ...
-[voice] Listening on plughw:2,0; say 'Nox' followed by a command
+[voice] Listening on plughw:2,0; say 'Fluffy' followed by a command
 ```
 
 ## Test local safety before walking
@@ -106,8 +115,8 @@ Expected startup includes:
 Keep PiDog on the floor with clearance. First test while it is stationary:
 
 ```text
-Nox stop
-Nox lie down
+Fluffy stop
+Fluffy lie down
 ```
 
 The Pi log should show `ACCEPTED stop` or `ACCEPTED lie_down`, while the body
@@ -132,9 +141,9 @@ Voice commands enabled: select me | arm head | follow me | stop | lie down
 Stand alone in view and speak the commands in order:
 
 ```text
-Nox select me
-Nox arm head
-Nox follow me
+Fluffy select me
+Fluffy arm head
+Fluffy follow me
 ```
 
 The terminal prints every accepted command and the reason for any refusal.

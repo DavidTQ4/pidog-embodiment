@@ -1,0 +1,98 @@
+#!/usr/bin/env bash
+set -uo pipefail
+
+SERVICES=(nox-body.service nox-bridge.service nox-voice.service pidog-h264.service)
+BRIDGE_HOST=127.0.0.1
+BRIDGE_PORT=8888
+H264_PORT=9001
+
+log()  { printf '[pidog-start] %s\n' "$*"; }
+fail() { printf '[pidog-start] ERROR: %s\n' "$*" >&2; exit 1; }
+
+[[ ${EUID} -eq 0 ]] || fail "run with sudo"
+
+for unit in "${SERVICES[@]}"; do
+    systemctl cat "$unit" >/dev/null 2>&1 || fail "$unit is not installed"
+done
+
+log "enabling PiDog services (H.264 camera is the boot default)"
+systemctl enable "${SERVICES[@]}" >/dev/null
+
+log "starting body controller"
+systemctl start nox-body.service || fail "could not start nox-body.service"
+for _ in {1..20}; do
+    systemctl is-active --quiet nox-body.service && break
+    sleep 0.5
+done
+systemctl is-active --quiet nox-body.service || {
+    journalctl -u nox-body.service -n 20 --no-pager -l >&2
+    fail "body controller did not become active"
+}
+
+log "starting HTTP bridge"
+systemctl start nox-bridge.service || fail "could not start nox-bridge.service"
+for _ in {1..20}; do
+    if python3 - "$BRIDGE_HOST" "$BRIDGE_PORT" <<'PY' >/dev/null 2>&1
+import socket, sys
+with socket.create_connection((sys.argv[1], int(sys.argv[2])), timeout=0.5):
+    pass
+PY
+    then
+        break
+    fi
+    sleep 0.5
+done
+
+python3 - "$BRIDGE_HOST" "$BRIDGE_PORT" <<'PY' >/dev/null 2>&1 || {
+import socket, sys
+with socket.create_connection((sys.argv[1], int(sys.argv[2])), timeout=2):
+    pass
+PY
+    journalctl -u nox-bridge.service -n 20 --no-pager -l >&2
+    fail "HTTP bridge did not open port $BRIDGE_PORT"
+}
+
+log "starting offline voice service"
+systemctl start nox-voice.service || fail "could not start nox-voice.service"
+for _ in {1..20}; do
+    systemctl is-active --quiet nox-voice.service && break
+    sleep 0.5
+done
+systemctl is-active --quiet nox-voice.service || {
+    journalctl -u nox-voice.service -n 20 --no-pager -l >&2
+    fail "offline voice service did not become active"
+}
+
+# Do not request /frame.jpg here: that would make ViLib claim the camera before
+# the hardware H.264 streamer. Snapshot/MJPEG remains available on demand via
+# 'sudo pidog-camera-mode snapshot'.
+log "starting low-latency H.264 camera on 127.0.0.1:$H264_PORT"
+systemctl start pidog-h264.service || fail "could not start pidog-h264.service"
+
+h264_ok=0
+for _ in {1..40}; do
+    if systemctl is-active --quiet pidog-h264.service &&
+       python3 - "$H264_PORT" <<'PY' >/dev/null 2>&1
+import socket, sys
+with socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=0.5):
+    pass
+PY
+    then
+        h264_ok=1
+        break
+    fi
+    sleep 0.5
+done
+
+if [[ $h264_ok -ne 1 ]]; then
+    journalctl -u pidog-h264.service -u nox-body.service -n 40 --no-pager -l >&2
+    fail "H.264 camera stream did not open port $H264_PORT"
+fi
+
+log "service state:"
+for unit in "${SERVICES[@]}"; do
+    printf '  %-22s %s\n' "$unit" "$(systemctl is-active "$unit" 2>/dev/null || true)"
+done
+printf '  %-22s %s\n' "bridge :$BRIDGE_PORT" "ready"
+printf '  %-22s %s\n' "H.264 camera :$H264_PORT" "ready"
+log "PiDog local services and H.264 camera are ready"

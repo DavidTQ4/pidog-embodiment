@@ -1,0 +1,15 @@
+[Unit]
+Description=PiDog low-latency hardware H.264 camera stream
+After=nox-body.service
+Wants=nox-body.service
+
+[Service]
+Type=simple
+User=david
+Group=david
+ExecStart=/usr/bin/rpicam-vid -t 0 -n --codec h264 --width 640 --height 480 --framerate 10 --bitrate 800000 --intra 10 --profile baseline --level 4 --inline --flush --listen -o tcp://127.0.0.1:9001
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

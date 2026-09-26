@@ -1,0 +1,17 @@
+[Unit]
+Description=PiDog outbound Tailscale link to desktop brain
+Wants=network-online.target tailscaled.service pidog-boot.service
+After=network-online.target tailscaled.service pidog-boot.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=david
+Group=david
+ExecStart=/usr/local/sbin/pidog-brain-link
+Restart=always
+RestartSec=5
+TimeoutStopSec=5
+
+[Install]
+WantedBy=multi-user.target

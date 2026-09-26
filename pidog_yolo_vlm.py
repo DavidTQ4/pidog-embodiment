@@ -4,8 +4,11 @@ All visual processing runs on the desktop GPU. The Raspberry Pi provides the
 MJPEG stream and accepts deliberately bounded head-position commands. Movement
 starts disarmed and selecting a person never arms it.
 
-Expected SSH forward:
-  http://127.0.0.1:19000/mjpg -> Pi 127.0.0.1:9000/mjpg
+Default camera transport:
+  tcp://127.0.0.1:19001 -> Pi 127.0.0.1:9001 (raw hardware H.264)
+
+Explicit snapshot/MJPEG fallback:
+  --stream http://127.0.0.1:19000/mjpg.jpg
 
 Controls:
   V / Space  Ask Qwen about the newest clean frame and current YOLO tracks
@@ -24,7 +27,16 @@ Controls:
 from __future__ import annotations
 
 import argparse
+import base64
 import json
+import os
+import subprocess
+import tempfile
+
+try:
+    import av
+except ImportError:
+    av = None
 import textwrap
 import threading
 import time
@@ -37,7 +49,11 @@ import numpy as np
 import requests
 import torch
 from PIL import Image
-from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
+from transformers import (
+    AutoProcessor,
+    Qwen3VLForConditionalGeneration,
+    pipeline,
+)
 from ultralytics import YOLO
 
 from pidog_face_identity import (
@@ -51,17 +67,20 @@ from pidog_face_identity import (
 )
 
 
-DEFAULT_STREAM = "http://127.0.0.1:19000/mjpg"
+DEFAULT_STREAM = "tcp://127.0.0.1:19001"
 DEFAULT_ROBOT_API = "http://127.0.0.1:18888"
 DEFAULT_VLM_MODEL = "Qwen/Qwen3-VL-4B-Instruct"
 DEFAULT_YOLO_MODEL = "yolo11n.pt"
 DEFAULT_POSE_MODEL = "yolo11n-pose.pt"
 DEFAULT_PROMPT = (
-    "Describe the scene from the robot dog's viewpoint. Use the supplied YOLO "
-    "tracks as fallible hints and check them against the image. Identify the "
-    "most relevant visible subject, give its YOLO track_id if one applies, "
-    "describe its relative position, and mention immediate obstacles or hazards. "
-    "Do not invent a track ID and do not issue movement commands. Be concise."
+    "You are Fluffy, a robot dog. Describe what you can currently see from "
+    "your own first-person viewpoint, using natural spoken English. Use the "
+    "supplied YOLO tracks as fallible hints and check them against the image. "
+    "Mention the most relevant people, objects, activity, and any immediate "
+    "obstacles or hazards. If useful, identify an operator-selected person by "
+    "name, but do not speak YOLO track IDs or technical metadata. Do not issue "
+    "movement commands. Respond with plain text in two to four concise "
+    "sentences suitable for speaking aloud."
 )
 
 # Conservative person-tracking controller. The VLM never supplies angles.
@@ -95,7 +114,18 @@ MIN_POSE_BOX_IOU = 0.25
 
 
 class LatestFrameCamera:
-    """Continuously decode MJPEG while retaining only the newest frame."""
+    """Continuously decode HTTP MJPEG while retaining only the newest frame.
+
+    OpenCV/FFmpeg's ``VideoCapture`` can build a substantial internal buffer on
+    higher-latency links. Reading the multipart byte stream directly keeps the
+    camera thread aligned with arrived frames and avoids processing a stale
+    queue.
+    """
+
+    JPEG_START = b"\xff\xd8"
+    JPEG_END = b"\xff\xd9"
+    STREAM_CHUNK_BYTES = 16 * 1024
+    MAX_BUFFER_BYTES = 8 * 1024 * 1024
 
     def __init__(self, url: str):
         self.url = url
@@ -104,6 +134,7 @@ class LatestFrameCamera:
         self.error: str | None = None
         self.lock = threading.Lock()
         self.stop_event = threading.Event()
+        self.reconnect_event = threading.Event()
         self.thread = threading.Thread(target=self._run, daemon=True)
 
     def start(self) -> None:
@@ -113,43 +144,170 @@ class LatestFrameCamera:
         self.stop_event.set()
         self.thread.join(timeout=3)
 
+    def reconnect(self) -> None:
+        """Drop the current H.264 TCP session and start from a fresh stream."""
+        if self.url.lower().startswith("tcp://"):
+            self.reconnect_event.set()
+
     def latest(self) -> tuple[int, np.ndarray | None, str | None]:
         with self.lock:
             frame = None if self.frame is None else self.frame.copy()
             return self.sequence, frame, self.error
 
-    def _open(self) -> cv2.VideoCapture:
-        capture = cv2.VideoCapture(self.url, cv2.CAP_FFMPEG)
-        if not capture.isOpened():
-            capture.release()
-            capture = cv2.VideoCapture(self.url)
-        capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        return capture
+    def _run_snapshot(self) -> None:
+        """Repeatedly request ViLib's current JPEG without building a backlog."""
+        session = requests.Session()
+        try:
+            while not self.stop_event.is_set():
+                try:
+                    response = session.get(
+                        self.url,
+                        headers={"Cache-Control": "no-cache"},
+                        timeout=(5, 5),
+                    )
+                    response.raise_for_status()
+                    frame = cv2.imdecode(
+                        np.frombuffer(response.content, dtype=np.uint8),
+                        cv2.IMREAD_COLOR,
+                    )
+                    if frame is None:
+                        raise ValueError("camera returned an invalid JPEG")
+                    with self.lock:
+                        self.frame = frame
+                        self.sequence += 1
+                        self.error = None
+                except (requests.RequestException, ValueError) as exc:
+                    with self.lock:
+                        self.error = f"Latest-frame request failed: {exc}"
+                    self.stop_event.wait(0.2)
+        finally:
+            session.close()
+
+    def _run_h264(self) -> None:
+        """Decode a low-latency raw H.264 TCP stream, retaining one frame."""
+        if av is None:
+            with self.lock:
+                self.error = (
+                    "H.264 mode requires PyAV; install it with: python -m pip install av"
+                )
+            return
+
+        while not self.stop_event.is_set():
+            container = None
+            try:
+                container = av.open(
+                    self.url,
+                    format="h264",
+                    mode="r",
+                    options={
+                        "fflags": "nobuffer",
+                        "flags": "low_delay",
+                        "probesize": "32",
+                        "analyzeduration": "0",
+                    },
+                    timeout=(5.0, 5.0),
+                )
+                with self.lock:
+                    self.error = None
+                for decoded in container.decode(video=0):
+                    if self.stop_event.is_set():
+                        break
+                    if self.reconnect_event.is_set():
+                        self.reconnect_event.clear()
+                        with self.lock:
+                            self.error = "Discarding queued H.264 data; reconnecting"
+                        break
+                    frame = decoded.to_ndarray(format="bgr24")
+                    with self.lock:
+                        self.frame = frame
+                        self.sequence += 1
+                        self.error = None
+            except Exception as exc:
+                with self.lock:
+                    self.error = f"H.264 stream interrupted: {exc}"
+                self.stop_event.wait(0.5)
+            finally:
+                if container is not None:
+                    container.close()
 
     def _run(self) -> None:
+        if self.url.lower().startswith("tcp://"):
+            self._run_h264()
+            return
+
+        if self.url.lower().split("?", 1)[0].endswith((".jpg", ".jpeg")):
+            self._run_snapshot()
+            return
+
         while not self.stop_event.is_set():
-            capture = self._open()
-            if not capture.isOpened():
+            try:
+                response = requests.get(
+                    self.url,
+                    stream=True,
+                    timeout=(5, 10),
+                )
+                response.raise_for_status()
+            except requests.RequestException as exc:
                 with self.lock:
-                    self.error = f"Could not open stream: {self.url}"
+                    self.error = f"Could not open stream: {exc}"
                 time.sleep(1)
                 continue
 
             with self.lock:
                 self.error = None
 
-            while not self.stop_event.is_set():
-                ok, frame = capture.read()
-                if not ok or frame is None:
-                    with self.lock:
-                        self.error = "Stream stopped; reconnecting"
-                    break
-                with self.lock:
-                    self.frame = frame
-                    self.sequence += 1
-                    self.error = None
+            buffer = bytearray()
+            try:
+                for chunk in response.iter_content(self.STREAM_CHUNK_BYTES):
+                    if self.stop_event.is_set():
+                        break
+                    if not chunk:
+                        continue
 
-            capture.release()
+                    buffer.extend(chunk)
+                    while True:
+                        start = buffer.find(self.JPEG_START)
+                        if start < 0:
+                            # Retain one byte in case a JPEG marker is split
+                            # across adjacent HTTP chunks.
+                            if len(buffer) > 1:
+                                del buffer[:-1]
+                            break
+
+                        end = buffer.find(self.JPEG_END, start + 2)
+                        if end < 0:
+                            if start:
+                                del buffer[:start]
+                            if len(buffer) > self.MAX_BUFFER_BYTES:
+                                buffer.clear()
+                                with self.lock:
+                                    self.error = (
+                                        "Oversized/incomplete MJPEG frame; "
+                                        "resynchronising"
+                                    )
+                            break
+
+                        jpeg = bytes(buffer[start : end + 2])
+                        del buffer[: end + 2]
+                        frame = cv2.imdecode(
+                            np.frombuffer(jpeg, dtype=np.uint8),
+                            cv2.IMREAD_COLOR,
+                        )
+                        if frame is None:
+                            continue
+                        with self.lock:
+                            self.frame = frame
+                            self.sequence += 1
+                            self.error = None
+            except requests.RequestException as exc:
+                with self.lock:
+                    self.error = f"Stream interrupted ({exc}); reconnecting"
+            finally:
+                response.close()
+
+            if not self.stop_event.is_set() and self.error is None:
+                with self.lock:
+                    self.error = "Stream stopped; reconnecting"
             if not self.stop_event.is_set():
                 time.sleep(0.5)
 
@@ -447,6 +605,10 @@ class VLMObserver:
         self.max_new_tokens = max_new_tokens
         self.state = AnalysisState()
         self.lock = threading.Lock()
+        self.conversation_history: deque[dict[str, str]] = deque(maxlen=12)
+        self.transcriber = None
+        self.last_scene_text = ""
+        self.last_scene_time = 0.0
 
         print(f"GPU: {torch.cuda.get_device_name(0)}")
         print(f"Loading VLM: {model_id}")
@@ -474,6 +636,7 @@ class VLMObserver:
         frame: np.ndarray,
         detections: list[Detection],
         prompt: str,
+        on_complete=None,
     ) -> bool:
         with self.lock:
             if self.state.running:
@@ -486,7 +649,7 @@ class VLMObserver:
 
         threading.Thread(
             target=self._analyse,
-            args=(frame.copy(), list(detections), prompt),
+            args=(frame.copy(), list(detections), prompt, on_complete),
             daemon=True,
         ).start()
         return True
@@ -496,6 +659,7 @@ class VLMObserver:
         bgr_frame: np.ndarray,
         detections: list[Detection],
         prompt: str,
+        on_complete=None,
     ) -> None:
         started = time.perf_counter()
         try:
@@ -546,10 +710,20 @@ class VLMObserver:
                 self.state.text = result or "Model returned an empty response"
                 self.state.seconds = seconds
                 self.state.running = False
+                self.last_scene_text = result
+                self.last_scene_time = time.time()
             print(
                 f"\nVLM ({seconds:.2f}s, {len(detections)} YOLO tracks):\n"
                 f"{result}\n"
             )
+            if on_complete is not None and result:
+                try:
+                    on_complete(result)
+                except Exception as callback_error:
+                    print(
+                        "VLM result callback failed: "
+                        f"{type(callback_error).__name__}: {callback_error}"
+                    )
         except Exception as exc:
             seconds = time.perf_counter() - started
             message = f"{type(exc).__name__}: {exc}"
@@ -559,6 +733,278 @@ class VLMObserver:
                 self.state.error = message
                 self.state.running = False
             print(f"\nVLM error: {message}\n")
+
+
+    def submit_conversation(
+        self,
+        audio: bytes,
+        sample_rate: int,
+        fallback_text: str,
+        robot_context: dict[str, object],
+        on_complete=None,
+    ) -> bool:
+        """Transcribe and answer one conversational voice turn asynchronously."""
+        with self.lock:
+            if self.state.running:
+                return False
+            self.state.running = True
+            self.state.error = None
+            self.state.text = "Listening and preparing a response..."
+            self.state.seconds = None
+            self.state.detections_used = 0
+
+        threading.Thread(
+            target=self._converse,
+            args=(
+                bytes(audio),
+                int(sample_rate),
+                fallback_text,
+                dict(robot_context),
+                on_complete,
+            ),
+            daemon=True,
+        ).start()
+        return True
+
+    def _get_transcriber(self):
+        if self.transcriber is None:
+            print("Loading desktop Whisper: openai/whisper-base.en")
+            self.transcriber = pipeline(
+                "automatic-speech-recognition",
+                model="openai/whisper-base.en",
+                device=0,
+                dtype=torch.float16,
+            )
+            print("Desktop Whisper ready")
+        return self.transcriber
+
+    def _converse(
+        self,
+        audio: bytes,
+        sample_rate: int,
+        fallback_text: str,
+        robot_context: dict[str, object],
+        on_complete=None,
+    ) -> None:
+        started = time.perf_counter()
+        try:
+            transcript = fallback_text
+            if audio:
+                samples = np.frombuffer(audio, dtype="<i2").astype(np.float32)
+                samples /= 32768.0
+                # The .en Whisper checkpoints are English-only. Recent
+                # Transformers versions reject language/task generation
+                # options for these models; their defaults already perform
+                # English transcription.
+                transcription = self._get_transcriber()(
+                    {"raw": samples, "sampling_rate": sample_rate},
+                )
+                candidate = str(transcription.get("text", "")).strip()
+                if candidate:
+                    transcript = candidate
+
+            words = transcript.strip().split()
+            if words and words[0].lower().rstrip(",.!?") == "fluffy":
+                transcript = " ".join(words[1:]).strip()
+            if not transcript:
+                transcript = "What did you hear me say?"
+
+            scene_age = (
+                round(time.time() - self.last_scene_time, 1)
+                if self.last_scene_time
+                else None
+            )
+            context = dict(robot_context)
+            context["last_visual_description"] = self.last_scene_text or None
+            context["visual_description_age_seconds"] = scene_age
+
+            system_prompt = (
+                "You are Fluffy, an embodied robot dog speaking with a person. "
+                "Be warm, curious and concise without pretending to be a real "
+                "animal. Ground every claim about sight, identity, movement, "
+                "distance and completed actions in the supplied robot state. "
+                "A visible identity is not proof of who is speaking. Never claim "
+                "that a requested action happened unless its confirmed state or "
+                "result says so. You have no authority to invent or directly "
+                "execute movement. If asked to do something outside the existing "
+                "voice commands, explain that briefly. Reply in plain spoken "
+                "English, normally one to three sentences, with no markdown."
+            )
+            context_text = json.dumps(context, ensure_ascii=False)
+            messages = [
+                {
+                    "role": "system",
+                    "content": [{"type": "text", "text": system_prompt}],
+                }
+            ]
+            for item in self.conversation_history:
+                messages.append({
+                    "role": item["role"],
+                    "content": [{"type": "text", "text": item["content"]}],
+                })
+            messages.append({
+                "role": "user",
+                "content": [{
+                    "type": "text",
+                    "text": (
+                        f"Current verified robot state:\n{context_text}\n\n"
+                        f"Person says: {transcript}"
+                    ),
+                }],
+            })
+
+            inputs = self.processor.apply_chat_template(
+                messages,
+                tokenize=True,
+                add_generation_prompt=True,
+                return_dict=True,
+                return_tensors="pt",
+            ).to(self.model.device)
+            input_length = inputs["input_ids"].shape[1]
+            with torch.inference_mode():
+                output_ids = self.model.generate(
+                    **inputs,
+                    max_new_tokens=min(self.max_new_tokens, 180),
+                    do_sample=False,
+                    use_cache=True,
+                )
+            generated_ids = output_ids[:, input_length:]
+            result = self.processor.batch_decode(
+                generated_ids,
+                skip_special_tokens=True,
+                clean_up_tokenization_spaces=False,
+            )[0].strip()
+            if not result:
+                result = "I am not sure how to answer that yet."
+
+            seconds = time.perf_counter() - started
+            with self.lock:
+                self.conversation_history.append({
+                    "role": "user",
+                    "content": transcript,
+                })
+                self.conversation_history.append({
+                    "role": "assistant",
+                    "content": result,
+                })
+                self.state.text = result
+                self.state.seconds = seconds
+                self.state.running = False
+            print(
+                f"\nCONVERSATION ({seconds:.2f}s)\n"
+                f"HEARD: {transcript}\n"
+                f"FLUFFY: {result}\n"
+            )
+            if on_complete is not None:
+                try:
+                    on_complete(result)
+                except Exception as callback_error:
+                    print(
+                        "Conversation speech callback failed: "
+                        f"{type(callback_error).__name__}: {callback_error}"
+                    )
+        except Exception as exc:
+            seconds = time.perf_counter() - started
+            message = f"{type(exc).__name__}: {exc}"
+            with self.lock:
+                self.state.text = "Conversation failed; see terminal"
+                self.state.seconds = seconds
+                self.state.error = message
+                self.state.running = False
+            print(f"\nConversation error: {message}\n")
+
+
+def synthesize_windows_speech(text: str) -> bytes:
+    """Render offline Windows SAPI speech to a PCM WAV on the desktop."""
+    if os.name != "nt":
+        raise RuntimeError(
+            "Desktop TTS currently requires Windows System.Speech"
+        )
+
+    with tempfile.TemporaryDirectory(prefix="pidog_tts_") as directory:
+        wav_path = Path(directory) / "speech.wav"
+        text_b64 = base64.b64encode(text.encode("utf-8")).decode("ascii")
+        wav_literal = str(wav_path).replace("'", "''")
+        powershell = f"""
+Add-Type -AssemblyName System.Speech
+$wavPath = '{wav_literal}'
+$textBytes = [System.Convert]::FromBase64String('{text_b64}')
+$text = [System.Text.Encoding]::UTF8.GetString($textBytes)
+$synth = New-Object System.Speech.Synthesis.SpeechSynthesizer
+try {{
+    $synth.Rate = 1
+    $synth.SetOutputToWaveFile($wavPath)
+    $synth.Speak($text)
+}}
+finally {{
+    $synth.Dispose()
+}}
+"""
+        encoded_command = base64.b64encode(
+            powershell.encode("utf-16le")
+        ).decode("ascii")
+        completed = subprocess.run(
+            [
+                "powershell.exe",
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-EncodedCommand",
+                encoded_command,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        if completed.returncode != 0:
+            detail = completed.stderr.strip() or completed.stdout.strip()
+            raise RuntimeError(f"Windows speech synthesis failed: {detail}")
+        if not wav_path.exists():
+            raise RuntimeError("Windows speech synthesis produced no WAV file")
+        audio = wav_path.read_bytes()
+
+    if len(audio) < 44 or audio[:4] != b"RIFF" or audio[8:12] != b"WAVE":
+        raise RuntimeError("Windows speech synthesis returned an invalid WAV")
+    return audio
+
+
+def speak_robot(robot_api: str, text: str) -> None:
+    """Synthesize speech on the desktop and upload only the WAV to PiDog."""
+    started = time.perf_counter()
+    audio = synthesize_windows_speech(text)
+    synthesis_seconds = time.perf_counter() - started
+
+    response = requests.post(
+        f"{robot_api.rstrip('/')}/audio/play",
+        json={"audio_b64": base64.b64encode(audio).decode("ascii")},
+        timeout=(1.0, 15.0),
+    )
+    response.raise_for_status()
+    payload = response.json()
+    if payload.get("error") or payload.get("ok") is False:
+        raise RuntimeError(str(payload))
+    print(
+        f"[TTS] desktop synthesis {synthesis_seconds:.2f}s | "
+        f"{len(audio) / 1024:.0f} KiB uploaded | "
+        f"audio {payload.get('duration_s', '?')}s"
+    )
+
+
+def sound_direction_to_head_yaw(direction_deg: object) -> float | None:
+    """Map PiDog's clockwise acoustic bearing to bounded head yaw."""
+    try:
+        direction = float(direction_deg) % 360.0
+    except (TypeError, ValueError):
+        return None
+    if direction <= 160.0:
+        return float(np.clip(-direction, YAW_LIMITS[0], YAW_LIMITS[1]))
+    if direction >= 200.0:
+        return float(np.clip(360.0 - direction, YAW_LIMITS[0], YAW_LIMITS[1]))
+    # A head-only movement cannot resolve the ambiguous rear sector safely.
+    return None
 
 
 def command_head(
@@ -669,6 +1115,9 @@ VOICE_COMMANDS = {
     "arm head": "arm_head",
     "track me": "arm_head",
     "follow me": "follow_me",
+    "what do you see": "describe_scene",
+    "what can you see": "describe_scene",
+    "tell me what you see": "describe_scene",
     "stop": "stop",
     "halt": "stop",
     "lie down": "lie_down",
@@ -686,6 +1135,8 @@ def voice_message_command(message: dict[str, object]) -> str | None:
         "select_me",
         "arm_head",
         "follow_me",
+        "describe_scene",
+        "conversation",
         "stop",
         "lie_down",
         "stop_and_lie_down",
@@ -695,7 +1146,7 @@ def voice_message_command(message: dict[str, object]) -> str | None:
     if not isinstance(text, str):
         return None
     words = text.lower().strip().split()
-    if words and words[0] in {"nox", "knox", "knocks"}:
+    if words and words[0] in {"fluffy", "nox", "knox", "knocks"}:
         words = words[1:]
     return VOICE_COMMANDS.get(" ".join(words))
 
@@ -731,6 +1182,54 @@ def fetch_voice_commands(
         if command is not None:
             commands.append((command, message))
     return commands
+
+
+class VoiceCommandPoller:
+    """Poll the Pi voice inbox without blocking the vision/control loop."""
+
+    def __init__(self, robot_api: str, interval: float):
+        self.robot_api = robot_api
+        self.interval = interval
+        self.commands: deque[tuple[str, dict[str, object]]] = deque()
+        self.error: str | None = None
+        self.lock = threading.Lock()
+        self.stop_event = threading.Event()
+        self.thread = threading.Thread(target=self._run, daemon=True)
+
+    def start(self) -> None:
+        self.thread.start()
+
+    def stop(self) -> None:
+        self.stop_event.set()
+        self.thread.join(timeout=2)
+
+    def drain(
+        self,
+    ) -> tuple[list[tuple[str, dict[str, object]]], str | None]:
+        with self.lock:
+            commands = list(self.commands)
+            self.commands.clear()
+            error = self.error
+            self.error = None
+        return commands, error
+
+    def _run(self) -> None:
+        session = requests.Session()
+        try:
+            while not self.stop_event.is_set():
+                try:
+                    commands = fetch_voice_commands(session, self.robot_api)
+                    with self.lock:
+                        self.commands.extend(commands)
+                        self.error = None
+                except requests.RequestException as exc:
+                    with self.lock:
+                        self.error = str(exc)
+
+                if self.stop_event.wait(self.interval):
+                    break
+        finally:
+            session.close()
 
 
 def command_body_action(
@@ -1169,7 +1668,15 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="PiDog YOLO tracker with asynchronous Qwen3-VL reasoning."
     )
-    parser.add_argument("--stream", default=DEFAULT_STREAM)
+    parser.add_argument(
+        "--stream",
+        default=DEFAULT_STREAM,
+        help=(
+            "Camera source. Defaults to the low-latency H.264 tunnel at "
+            "tcp://127.0.0.1:19001. Use "
+            "--stream http://127.0.0.1:19000/mjpg.jpg for frame mode."
+        ),
+    )
     parser.add_argument("--robot-api", default=DEFAULT_ROBOT_API)
     parser.add_argument("--vlm-model", default=DEFAULT_VLM_MODEL)
     parser.add_argument("--yolo-model", default=DEFAULT_YOLO_MODEL)
@@ -1181,7 +1688,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--face-model-directory", default="face_models")
     parser.add_argument("--prompt", default=DEFAULT_PROMPT)
-    parser.add_argument("--max-new-tokens", type=int, default=160)
+    parser.add_argument(
+        "--max-new-tokens",
+        type=int,
+        default=220,
+        help="Maximum VLM response tokens; 220 allows concise busy-scene summaries.",
+    )
     parser.add_argument("--confidence", type=float, default=0.35)
     parser.add_argument("--pose-confidence", type=float, default=0.35)
     parser.add_argument(
@@ -1409,21 +1921,27 @@ def main() -> None:
     identity_labels: dict[int, tuple[str, float]] = {}
     follow_log = FollowStateLogger()
     voice_command_queue: deque[tuple[str, dict[str, object]]] = deque()
-    last_voice_poll_time = 0.0
+    voice_poller: VoiceCommandPoller | None = None
     last_voice_error_log_time = 0.0
+    voice_event_history: deque[dict[str, object]] = deque(maxlen=12)
 
     print(
         "1-9: select person | 0: clear | C: centre | M: head arm/disarm | "
         "T: identity body-follow arm/disarm | "
         "A: fallback aim | H: head aim | V/Space: VLM | Y: YOLO on/off | "
-        "Q/Esc: quit"
+        "R: refresh video | Q/Esc: quit"
     )
     if args.disable_voice_commands:
         print("Pi voice-command polling disabled")
     else:
+        voice_poller = VoiceCommandPoller(
+            args.robot_api,
+            args.voice_poll_interval,
+        )
+        voice_poller.start()
         print(
-            "Voice commands enabled: select me | arm head | follow me | "
-            "stop | lie down"
+            "Voice commands enabled asynchronously: select me | arm head | "
+            "follow me | what do you see | conversation | stop | lie down"
         )
     try:
         deadline = time.monotonic() + 15
@@ -2124,7 +2642,7 @@ def main() -> None:
                 f"{len(yolo_state.detections)} tracks | "
                 f"detect {yolo_state.inference_ms:.0f} ms | "
                 f"pose {pose_state.inference_ms:.0f} ms | "
-                f"{display_fps:.1f} FPS"
+                f"camera {display_fps:.1f} FPS"
             )
             cv2.putText(
                 display_frame,
@@ -2250,24 +2768,21 @@ def main() -> None:
             cv2.imshow("PiDog YOLO + Qwen VLM", display_frame)
             key = cv2.waitKey(1) & 0xFF
 
-            # Polling is deliberately lightweight and separate from camera
-            # transport.  Safety commands have already been executed locally
-            # by the Pi; consuming them here disarms the desktop controller so
-            # it cannot admit another gait.
+            # The worker performs all voice-inbox network I/O. Safety
+            # commands have already been executed locally by the Pi; consuming
+            # them here disarms the desktop controller so it cannot admit
+            # another gait.
             voice_now = time.perf_counter()
-            if (
-                not args.disable_voice_commands
-                and voice_now - last_voice_poll_time >= args.voice_poll_interval
-            ):
-                last_voice_poll_time = voice_now
-                try:
-                    voice_command_queue.extend(
-                        fetch_voice_commands(robot_session, args.robot_api)
-                    )
-                except requests.RequestException as exc:
-                    if voice_now - last_voice_error_log_time >= 10.0:
-                        print(f"Voice inbox unavailable: {exc}")
-                        last_voice_error_log_time = voice_now
+            speak_analysis_result = False
+            if voice_poller is not None:
+                new_voice_commands, voice_error = voice_poller.drain()
+                voice_command_queue.extend(new_voice_commands)
+                if (
+                    voice_error is not None
+                    and voice_now - last_voice_error_log_time >= 10.0
+                ):
+                    print(f"Voice inbox unavailable: {voice_error}")
+                    last_voice_error_log_time = voice_now
 
             if voice_command_queue:
                 voice_command, voice_message = voice_command_queue.popleft()
@@ -2277,6 +2792,49 @@ def main() -> None:
                     f"(heard={voice_message.get('text')!r}, "
                     f"confidence={confidence})"
                 )
+                voice_event_history.append({
+                    "time": round(time.time(), 3),
+                    "command": voice_command,
+                    "heard": voice_message.get("text"),
+                    "local_action": voice_message.get("local_action"),
+                    "local_ok": voice_message.get("local_ok"),
+                    "sound_direction_deg": voice_message.get(
+                        "sound_direction_deg"
+                    ),
+                })
+                sound_direction = voice_message.get("sound_direction_deg")
+                if (
+                    selected_track_id is None
+                    and not movement_enabled
+                    and sound_direction is not None
+                    and voice_command not in {
+                        "stop",
+                        "lie_down",
+                        "stop_and_lie_down",
+                    }
+                ):
+                    attention_yaw = sound_direction_to_head_yaw(
+                        sound_direction
+                    )
+                    if attention_yaw is None:
+                        print(
+                            "[ATTENTION] speaker detected in rear sector at "
+                            f"{sound_direction}deg; head-only turn skipped"
+                        )
+                    elif command_head(
+                        robot_session,
+                        args.robot_api,
+                        attention_yaw,
+                        0.0,
+                    ):
+                        yaw = attention_yaw
+                        pitch = 0.0
+                        head_reference_known = True
+                        print(
+                            "[ATTENTION] no person selected; looking toward "
+                            f"speaker bearing {float(sound_direction):.0f}deg "
+                            f"with head yaw {attention_yaw:+.0f}deg"
+                        )
                 if voice_command in {
                     "stop",
                     "lie_down",
@@ -2294,6 +2852,76 @@ def main() -> None:
                     print(
                         f"Voice {voice_command}: head/body following DISARMED; "
                         f"local posture action {local_status}"
+                    )
+                elif key == 255 and voice_command == "conversation":
+                    encoded_audio = voice_message.get("audio_b64")
+                    try:
+                        if not isinstance(encoded_audio, str):
+                            raise ValueError("conversation message has no audio")
+                        conversation_audio = base64.b64decode(
+                            encoded_audio,
+                            validate=True,
+                        )
+                        sample_rate = int(
+                            voice_message.get("sample_rate", 16000)
+                        )
+                        if not 8000 <= sample_rate <= 48000:
+                            raise ValueError(
+                                f"invalid sample rate: {sample_rate}"
+                            )
+                        robot_context = {
+                            "robot_name": "Fluffy",
+                            "speaker_identity": "unknown",
+                            "selected_visible_identity": selected_identity,
+                            "selected_track_id": selected_track_id,
+                            "head_tracking_armed": movement_enabled,
+                            "body_following_armed": turning_enabled,
+                            "head_yaw_degrees": round(yaw, 1),
+                            "head_pitch_degrees": round(pitch, 1),
+                            "ultrasonic_distance_cm": last_body_distance,
+                            "body_safety_stopped": body_safety_stopped,
+                            "last_safety_reason": last_safety_reason,
+                            "visible_detections": [
+                                item.prompt_record()
+                                for item in yolo_state.detections
+                            ],
+                            "recent_voice_events": list(
+                                voice_event_history
+                            ),
+                        }
+                        accepted = vlm.submit_conversation(
+                            conversation_audio,
+                            sample_rate,
+                            str(voice_message.get("text", "")),
+                            robot_context,
+                            on_complete=lambda result: speak_robot(
+                                args.robot_api,
+                                result,
+                            ),
+                        )
+                        if accepted:
+                            print(
+                                "Conversational turn accepted; desktop "
+                                "Whisper and Fluffy LLM response started"
+                            )
+                        else:
+                            print(
+                                "Conversation ignored because Qwen is "
+                                "already processing another request"
+                            )
+                            speak_robot(
+                                args.robot_api,
+                                "I am still thinking about the previous request.",
+                            )
+                    except Exception as exc:
+                        print(f"Conversation request rejected: {exc}")
+                    key = 255
+                elif key == 255 and voice_command == "describe_scene":
+                    speak_analysis_result = True
+                    key = ord("v")
+                    print(
+                        "Voice scene request accepted: analysing the newest "
+                        "camera frame and preparing a spoken response"
                     )
                 elif key == 255 and voice_command == "select_me":
                     people = selectable_people(yolo_state.detections)
@@ -2338,6 +2966,13 @@ def main() -> None:
 
             if key in (ord("q"), 27):
                 break
+            if key == ord("r"):
+                camera.reconnect()
+                print(
+                    "[CAMERA] reconnect requested; discarding any queued "
+                    "H.264 video"
+                )
+                key = 255
             if key == ord("y"):
                 yolo_enabled = not yolo_enabled
                 if not yolo_enabled:
@@ -2566,10 +3201,16 @@ def main() -> None:
                             f"identity {selected_identity or 'unknown'}."
                         )
                     )
+                    completion_callback = (
+                        (lambda result: speak_robot(args.robot_api, result))
+                        if speak_analysis_result
+                        else None
+                    )
                     if vlm.submit(
                         analysis_frame,
                         analysis_detections,
                         f"{args.prompt}\n{selected_context}",
+                        on_complete=completion_callback,
                     ):
                         print(
                             "VLM analysis started with "
@@ -2577,7 +3218,17 @@ def main() -> None:
                         )
                     else:
                         print("VLM inference already running; request ignored")
+                        if speak_analysis_result:
+                            try:
+                                speak_robot(
+                                    args.robot_api,
+                                    "I am still looking at the previous scene.",
+                                )
+                            except Exception as exc:
+                                print(f"Could not speak busy response: {exc}")
     finally:
+        if voice_poller is not None:
+            voice_poller.stop()
         head_controller.stop()
         camera.stop()
         robot_session.close()

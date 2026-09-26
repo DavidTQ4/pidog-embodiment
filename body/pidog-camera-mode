@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+MODE=${1:-}
+case "$MODE" in
+    h264)
+        command -v rpicam-vid >/dev/null 2>&1 || {
+            echo "rpicam-vid is not installed" >&2
+            exit 1
+        }
+        echo "[pidog-camera-mode] releasing ViLib camera"
+        systemctl stop pidog-h264.service 2>/dev/null || true
+        systemctl restart nox-body.service
+        sleep 3
+        echo "[pidog-camera-mode] starting hardware H.264 on 127.0.0.1:9001"
+        systemctl start pidog-h264.service
+        ;;
+    snapshot)
+        echo "[pidog-camera-mode] stopping H.264 camera"
+        systemctl stop pidog-h264.service 2>/dev/null || true
+        systemctl restart nox-body.service
+        sleep 3
+        echo "[pidog-camera-mode] starting ViLib camera"
+        python3 - <<'PY'
+import urllib.request
+with urllib.request.urlopen("http://127.0.0.1:8888/frame.jpg", timeout=20) as response:
+    payload = response.read()
+    if response.status != 200 or len(payload) < 1000:
+        raise RuntimeError(f"camera warm-up failed: {response.status}, {len(payload)} bytes")
+print(f"[pidog-camera-mode] snapshot camera ready ({len(payload)} bytes)")
+PY
+        ;;
+    status)
+        if systemctl is-active --quiet pidog-h264.service; then
+            echo "h264"
+        elif python3 - <<'PY' >/dev/null 2>&1
+import urllib.request
+with urllib.request.urlopen("http://127.0.0.1:9000/mjpg.jpg", timeout=2) as r:
+    raise SystemExit(0 if r.status == 200 else 1)
+PY
+        then
+            echo "snapshot"
+        else
+            echo "camera inactive"
+            exit 1
+        fi
+        ;;
+    *)
+        echo "usage: sudo pidog-camera-mode {h264|snapshot|status}" >&2
+        exit 2
+        ;;
+esac
