@@ -927,6 +927,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
                     "command",
                     "confidence",
                     "speaker",
+                    "sound_direction_deg",
                     "local_action",
                     "local_ok",
                     "audio_b64",
