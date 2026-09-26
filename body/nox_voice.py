@@ -195,9 +195,15 @@ def canonical_command(text: str, stop_without_wake: bool) -> str | None:
     words = text.lower().strip().split()
     if not words:
         return None
-    if words[0] in WAKE_WORDS:
-        phrase = " ".join(words[1:])
-        return PHRASE_TO_COMMAND.get(phrase)
+
+    # Vosk occasionally prefixes a short noise fragment, for example
+    # "flat fluffy sit". Accept the real wake word within the first three
+    # tokens, while still requiring the remainder to be an exact command.
+    for index, word in enumerate(words[:3]):
+        if word in WAKE_WORDS:
+            phrase = " ".join(words[index + 1:])
+            return PHRASE_TO_COMMAND.get(phrase)
+
     phrase = " ".join(words)
     if stop_without_wake and phrase in {"stop", "emergency stop"}:
         return "stop"
@@ -422,6 +428,15 @@ def main() -> int:
     # matching and confidence gates below still own all physical actions.
     recognizer = KaldiRecognizer(model, SAMPLE_RATE)
     recognizer.SetWords(True)
+    # A second grammar-constrained decoder restores reliable deterministic
+    # commands while the unrestricted decoder remains available for general
+    # conversation after the wake word.
+    command_recognizer = KaldiRecognizer(
+        model,
+        SAMPLE_RATE,
+        json.dumps(grammar_phrases(args.stop_without_wake)),
+    )
+    command_recognizer.SetWords(True)
 
     arecord_command = [
         "arecord",
@@ -476,6 +491,7 @@ def main() -> int:
                 last_echo_check = now
             if suppress_echo:
                 recognizer.Reset()
+                command_recognizer.Reset()
                 utterance_audio.clear()
                 continue
 
@@ -484,19 +500,43 @@ def main() -> int:
             if len(utterance_audio) > max_utterance_bytes:
                 print("[voice] Discarded utterance longer than 20 seconds", flush=True)
                 recognizer.Reset()
+                command_recognizer.Reset()
                 utterance_audio.clear()
                 continue
-            if not recognizer.AcceptWaveform(chunk):
+
+            speech_complete = recognizer.AcceptWaveform(chunk)
+            command_complete = command_recognizer.AcceptWaveform(chunk)
+            if not speech_complete and not command_complete:
                 continue
 
             audio = bytes(utterance_audio)
             utterance_audio.clear()
-            result = json.loads(recognizer.Result())
+            result = (
+                json.loads(recognizer.Result()) if speech_complete else {}
+            )
+            command_result = (
+                json.loads(command_recognizer.Result())
+                if command_complete
+                else {}
+            )
             text = " ".join(result.get("text", "").split())
-            command = canonical_command(text, args.stop_without_wake)
-            confidence = result_confidence(result)
+            command_text = " ".join(
+                command_result.get("text", "").split()
+            )
+            command = canonical_command(
+                command_text,
+                args.stop_without_wake,
+            )
+            if command is not None:
+                text = command_text
+                confidence = result_confidence(command_result)
+            else:
+                command = canonical_command(text, args.stop_without_wake)
+                confidence = result_confidence(result)
             words = text.lower().strip().split()
-            has_wake_word = bool(words and words[0] in WAKE_WORDS)
+            has_wake_word = any(
+                word in WAKE_WORDS for word in words[:3]
+            )
 
             if command is None:
                 if not has_wake_word:
