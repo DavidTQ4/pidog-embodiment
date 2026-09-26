@@ -945,30 +945,70 @@ def cmd_play_audio(path):
         previous = _audio_playback_process
         if previous is not None and previous.poll() is None:
             previous.terminate()
+        # PiDog initialises pygame on the Voice HAT and may hold the ALSA
+        # device exclusively. Stop any older pygame speech before replacing it.
+        try:
+            import pygame
+            pygame.mixer.music.stop()
+        except Exception:
+            pass
 
     def _play():
         global _audio_playback_process
         import subprocess as sp
 
         process = None
+        pygame_playback = False
         try:
             with _audio_playback_lock:
                 if generation != _audio_playback_generation:
                     return
-                process = sp.Popen(
-                    ["aplay", "-q", "-D", _PLAYBACK_DEVICE, str(audio_path)],
-                    stdout=sp.DEVNULL,
-                    stderr=sp.PIPE,
-                    text=True,
-                )
-                _audio_playback_process = process
-            _, stderr = process.communicate(timeout=120)
-            if process.returncode not in (0, -15):
+
+            # Use PiDog's existing pygame owner first. Opening a second direct
+            # ALSA client with aplay can fail silently while pygame owns hw:.
+            try:
+                with dog_lock:
+                    if hasattr(dog, "music") and dog.music is not None:
+                        dog.music.sound_play(str(audio_path))
+                        pygame_playback = True
+                if pygame_playback:
+                    print(
+                        f"[nox] desktop TTS playing via pygame: "
+                        f"{audio_path.name}",
+                        flush=True,
+                    )
+                    import pygame
+                    while pygame.mixer.music.get_busy():
+                        with _audio_playback_lock:
+                            if generation != _audio_playback_generation:
+                                pygame.mixer.music.stop()
+                                break
+                        time.sleep(0.05)
+            except Exception as exc:
+                pygame_playback = False
                 print(
-                    f"[nox] desktop TTS playback failed ({process.returncode}): "
-                    f"{stderr.strip()}",
+                    f"[nox] desktop TTS pygame failed; trying aplay: {exc}",
                     flush=True,
                 )
+
+            if not pygame_playback:
+                with _audio_playback_lock:
+                    if generation != _audio_playback_generation:
+                        return
+                    process = sp.Popen(
+                        ["aplay", "-q", "-D", _PLAYBACK_DEVICE, str(audio_path)],
+                        stdout=sp.DEVNULL,
+                        stderr=sp.PIPE,
+                        text=True,
+                    )
+                    _audio_playback_process = process
+                _, stderr = process.communicate(timeout=120)
+                if process.returncode not in (0, -15):
+                    print(
+                        f"[nox] desktop TTS playback failed "
+                        f"({process.returncode}): {stderr.strip()}",
+                        flush=True,
+                    )
         except sp.TimeoutExpired:
             if process is not None:
                 process.kill()
