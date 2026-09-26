@@ -7,7 +7,7 @@ Wants=nox-body.service
 Type=simple
 User=david
 Group=david
-ExecStart=/usr/bin/rpicam-vid -t 0 -n --codec h264 --width 640 --height 480 --framerate 15 --bitrate 1500000 --intra 15 --profile baseline --level 4 --inline --flush --listen -o tcp://127.0.0.1:9001
+ExecStart=/usr/bin/rpicam-vid -t 0 -n --codec h264 --width 640 --height 480 --framerate 10 --bitrate 800000 --intra 10 --profile baseline --level 4 --inline --flush --listen -o tcp://127.0.0.1:9001
 Restart=on-failure
 RestartSec=3
 
