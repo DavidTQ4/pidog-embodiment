@@ -30,6 +30,7 @@ import argparse
 import base64
 import json
 import os
+import re
 import subprocess
 import tempfile
 
@@ -1253,6 +1254,11 @@ class VLMObserver:
                         f"{action_result}"
                     ),
                 })
+                # The requested action is already complete and its verified
+                # result is in context. Stop offering the action tool for this
+                # turn so the model cannot redundantly request it again.
+                tools.remove(perform_robot_action)
+                available_tools.pop("perform_robot_action", None)
 
         if self.web_search_enabled and os.environ.get("OLLAMA_API_KEY"):
             tools.extend([fluffy_web_search, fluffy_web_fetch])
