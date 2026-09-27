@@ -39,11 +39,27 @@ def test_fast_request_and_tool_response(monkeypatch):
 
 def load_method(name, namespace):
     """Exercise production routing without loading CUDA/camera dependencies."""
+    namespace["runtime_identity"] = fluffy_openai.runtime_identity
     tree = ast.parse(Path("pidog_yolo_vlm.py").read_text(encoding="utf-8"))
     cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "VLMObserver")
     method = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == name)
     exec(compile(ast.Module(body=[method], type_ignores=[]), "pidog_yolo_vlm.py", "exec"), namespace)
     return namespace[name]
+
+
+@pytest.mark.parametrize("backend,model,fallback", [
+    ("ollama", "qwen3:8b", False),
+    ("openai", "gpt-6-luna", False),
+    ("openai", "custom-model", False),
+    ("transformers", "Qwen/custom-vision-model", True),
+])
+def test_runtime_identity(backend, model, fallback):
+    import json
+    prompt = fluffy_openai.runtime_identity(backend, model, fallback)
+    data = json.JSONDecoder().raw_decode(prompt[prompt.index("{"):])[0]
+    assert data["backend"] == backend
+    assert data["model_id"] == model
+    assert data["local_fallback"] is fallback
 
 
 @pytest.mark.parametrize("backend", ["openai", "ollama"])
@@ -71,6 +87,8 @@ def test_conversation_tool_round_trip(backend):
                                conversation_history=[], web_search_enabled=False)
     result = method(observer, "system", "{}", "What can you see?",
                     scene_observer=lambda: observations.append(True) or {"scene": "ball"})
+    assert f'"backend": "{backend}"' in turns[0][0]["content"]
+    assert '"model_id": "model"' in turns[0][0]["content"]
     assert result == "I see a ball."
     assert observations == [True]
     tool_result = turns[1][-1]

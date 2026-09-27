@@ -76,7 +76,7 @@ from ultralytics import YOLO
 
 from fluffy_action_broker import ACTION_SPECS, FluffyActionBroker
 from fluffy_games import FluffyGameCoordinator
-from fluffy_openai import chat as openai_chat, require_api_key
+from fluffy_openai import chat as openai_chat, require_api_key, runtime_identity
 from fluffy_camera import capture_camera_still
 from pidog_face_identity import (
     DEFAULT_IDENTITY_MARGIN,
@@ -748,6 +748,7 @@ class VLMObserver:
             )
 
         self.max_new_tokens = max_new_tokens
+        self.vlm_model_id = model_id
         self.conversation_backend = conversation_backend
         self.conversation_model = (
             openai_model.strip() if conversation_backend == "openai"
@@ -1197,7 +1198,9 @@ class VLMObserver:
             raise RuntimeError("Ollama conversation model is disabled")
 
         messages: list[object] = [
-            {"role": "system", "content": system_prompt},
+            {"role": "system", "content": system_prompt + runtime_identity(
+                self.conversation_backend, self.conversation_model
+            )},
         ]
         for item in self.conversation_history:
             messages.append({
@@ -1619,10 +1622,13 @@ class VLMObserver:
                     )
 
             if not result:
+                fallback_prompt = system_prompt + runtime_identity(
+                    "transformers", self.vlm_model_id, fallback=True
+                )
                 messages = [
                     {
                         "role": "system",
-                        "content": [{"type": "text", "text": system_prompt}],
+                        "content": [{"type": "text", "text": fallback_prompt}],
                     }
                 ]
                 for item in self.conversation_history:

@@ -7,6 +7,22 @@ from types import SimpleNamespace
 import requests
 
 
+def runtime_identity(backend, model, fallback=False):
+    """Describe the actual response path, including command-line overrides."""
+    location = "OpenAI API" if backend == "openai" else (
+        "local Transformers Qwen-VL" if backend == "transformers" else "Ollama")
+    return (
+        " Current authoritative runtime identity for this reply: "
+        + json.dumps({"backend": backend, "model_id": model,
+                      "runtime": location, "local_fallback": fallback})
+        + ". When asked which model or provider you use, report this exact model_id "
+        "and backend. This overrides identity claims from training or earlier replies. "
+        "It is the configured model identifier, not a verified underlying model "
+        "snapshot; do not invent version numbers. Keep your name Fluffy. "
+        "Do not search the web for your runtime identity."
+    )
+
+
 def require_api_key():
     key = os.environ.get("OPENAI_API_KEY", "").strip()
     if not key:
