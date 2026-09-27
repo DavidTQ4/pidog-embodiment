@@ -103,6 +103,42 @@ Brain (Pi 5 / Desktop / Cloud)          Body (Pi 4 / Any Robot)
 | `nox-vision` | Body (Pi 4) | — | Local scene analysis (SmolVLM-256M via llama.cpp) |
 | `nox-voice` | Body (Pi 4) | — | Wake word + Speech-to-Text (faster-whisper) |
 
+
+### Music-responsive dance
+
+The local voice service includes a manual, music-responsive dance inspired by
+[koua29/pidog-groove](https://github.com/koua29/pidog-groove). Say:
+
+- **“Fluffy dance”** — listen for a stable musical pulse, then move the head
+  and tail in time with it.
+- **“Fluffy stop dancing”** — stop immediately and centre the head and tail.
+- **“Fluffy stop”** — also cancels dancing before applying the normal local
+  safety stop.
+
+The first tempo lock needs approximately eight seconds of music. The detector
+continues to re-estimate a rolling window, settles when the pulse disappears,
+and ends the session after 120 seconds unless restarted. It never commands the
+legs. The microphone remains owned by `nox-voice`; servo access remains owned
+by `nox-body`, so no second ALSA capture process or `Pidog()` instance is
+created.
+
+Optional tuning in `body/nox-voice.env`:
+
+```bash
+NOX_GROOVE_ANALYSIS_SECONDS=8
+NOX_GROOVE_CONFIDENCE_MIN=0.45
+NOX_GROOVE_MAX_SECONDS=120
+```
+
+After pulling this version onto the Pi, restart both owners:
+
+```bash
+sudo systemctl restart nox-body nox-voice
+sudo journalctl -u nox-body -u nox-voice -f
+```
+
+Automatic idle dancing is deliberately not enabled in this first version.
+
 ## 🚀 Quick Start
 
 ### Prerequisites
