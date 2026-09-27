@@ -9,20 +9,16 @@ From the `pidog-embodiment` folder with the normal virtual environment active:
 
 ```powershell
 python -m pip install python-chess
-winget install --id Stockfish.Stockfish --exact
 ```
 
-Open a new PowerShell window and confirm that Stockfish is visible:
+Download the current Windows x86-64 build from
+`https://stockfishchess.org/download/`, extract it, and keep the `.exe` in a
+stable folder such as `C:\Tools\Stockfish`.
+
+Point Fluffy at the extracted executable before launching the controller:
 
 ```powershell
-stockfish
-```
-
-Type `quit` to exit it. If `stockfish` is not on `PATH`, point Fluffy at the
-downloaded executable before launching the controller:
-
-```powershell
-$env:STOCKFISH_PATH = "C:\path\to\stockfish-windows-x86-64-avx2.exe"
+$env:STOCKFISH_PATH = "C:\Tools\Stockfish\stockfish-windows-x86-64.exe"
 python .\pidog_yolo_vlm.py
 ```
 
@@ -31,7 +27,7 @@ To persist that path for future PowerShell windows:
 ```powershell
 [Environment]::SetEnvironmentVariable(
   "STOCKFISH_PATH",
-  "C:\path\to\stockfish-windows-x86-64-avx2.exe",
+  "C:\Tools\Stockfish\stockfish-windows-x86-64.exe",
   "User"
 )
 ```
@@ -47,4 +43,3 @@ To persist that path for future PowerShell windows:
 The phone remains a display and input device. The desktop validates every move,
 owns the authoritative board, and runs Stockfish. Only one phone/player lease is
 accepted at a time, as with tic-tac-toe.
-
