@@ -1963,6 +1963,21 @@ def keep_body_awake(session: requests.Session, robot_api: str) -> bool:
         return False
 
 
+def robot_motion_idle(session: requests.Session, robot_api: str) -> bool:
+    """Confirm that no Pi-side leg action remains buffered or in progress."""
+    try:
+        response = session.get(
+            f"{robot_api.rstrip('/')}/motion/status",
+            timeout=(0.35, 0.75),
+        )
+        response.raise_for_status()
+        status = response.json()
+        return bool(status.get("ok", True)) and bool(status.get("legs_done")) \
+            and not bool(status.get("busy"))
+    except (requests.RequestException, ValueError):
+        return False
+
+
 def selectable_people(detections: list[Detection]) -> list[Detection]:
     """Return trackable people ordered by their current screen position."""
 
@@ -2563,6 +2578,7 @@ def main() -> None:
             not vlm.snapshot().running
             and not movement_enabled
             and not turning_enabled
+            and robot_motion_idle(robot_session, args.robot_api)
         ),
         speak=lambda text: speak_robot(args.robot_api, text),
         on_game_lock=set_game_lock,
