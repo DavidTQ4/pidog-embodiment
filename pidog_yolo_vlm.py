@@ -76,6 +76,7 @@ from ultralytics import YOLO
 
 from fluffy_action_broker import ACTION_SPECS, FluffyActionBroker
 from fluffy_games import FluffyGameCoordinator
+from fluffy_openai import chat as openai_chat, require_api_key
 from pidog_face_identity import (
     DEFAULT_IDENTITY_MARGIN,
     FaceIdentityEngine,
@@ -724,6 +725,8 @@ class VLMObserver:
         web_search_enabled: bool,
         asr_model: str,
         asr_word_confidence: float,
+        conversation_backend: str = "ollama",
+        openai_model: str = "gpt-6-luna",
     ):
         if not torch.cuda.is_available():
             raise RuntimeError(
@@ -732,7 +735,13 @@ class VLMObserver:
             )
 
         self.max_new_tokens = max_new_tokens
-        self.conversation_model = conversation_model.strip()
+        self.conversation_backend = conversation_backend
+        self.conversation_model = (
+            openai_model.strip() if conversation_backend == "openai"
+            else conversation_model.strip()
+        )
+        if conversation_backend == "openai":
+            require_api_key()
         self.web_search_enabled = web_search_enabled
         self.asr_model = asr_model.strip()
         self.asr_word_confidence = float(asr_word_confidence)
@@ -753,7 +762,9 @@ class VLMObserver:
         ).eval()
         self.processor = AutoProcessor.from_pretrained(model_id)
         print("Qwen VLM ready")
-        if self.conversation_model:
+        if self.conversation_backend == "openai":
+            print(f"OpenAI conversation model: {self.conversation_model}; Fast mode")
+        elif self.conversation_model:
             if ollama_chat is None:
                 print(
                     "Ollama conversation unavailable: install with "
@@ -1002,7 +1013,7 @@ class VLMObserver:
     def submit_game_comment(self, game_context: dict, on_complete) -> bool:
         """Generate a short spoken comment about a current or finished game."""
         with self.lock:
-            if self.state.running or not self.conversation_model or ollama_chat is None:
+            if self.state.running or not self.conversation_model or (self.conversation_backend == "ollama" and ollama_chat is None):
                 return False
             self.state.running = True
             self.state.error = None
@@ -1026,7 +1037,7 @@ class VLMObserver:
                     "move and evaluation are authoritative; never invent a move or "
                     "change the outcome."
                 )
-                result = self._answer_with_ollama(
+                result = self._answer_with_conversation_model(
                     prompt,
                     json.dumps(game_context, ensure_ascii=False),
                     "Give your end-of-game comment.",
@@ -1150,7 +1161,7 @@ class VLMObserver:
         filtered_text = self._remove_wake_word(" ".join(accepted_words))
         return filtered_text, raw_text, len(accepted_words), len(all_words)
 
-    def _answer_with_ollama(
+    def _answer_with_conversation_model(
         self,
         system_prompt: str,
         context_text: str,
@@ -1158,8 +1169,8 @@ class VLMObserver:
         action_executor=None,
         scene_observer=None,
     ) -> str:
-        """Run a bounded Ollama tool loop for one conversational response."""
-        if ollama_chat is None:
+        """Run the selected backend through the same bounded robot-tool loop."""
+        if self.conversation_backend == "ollama" and ollama_chat is None:
             raise RuntimeError(
                 "Ollama Python package is not installed in this environment"
             )
@@ -1305,7 +1316,7 @@ class VLMObserver:
         )
         if force_web_search and "fluffy_web_search" in available_tools:
             print(
-                f"[OLLAMA] forced/requested web search: "
+                f"[CONVERSATION] forced/requested web search: "
                 f"{transcript!r}"
             )
             try:
@@ -1322,7 +1333,7 @@ class VLMObserver:
                 })
             except Exception as search_error:
                 print(
-                    "[OLLAMA] forced web search failed: "
+                    "[CONVERSATION] forced web search failed: "
                     f"{type(search_error).__name__}: {search_error}"
                 )
                 # Do not ask the small local model to relay this failure: it
@@ -1334,21 +1345,25 @@ class VLMObserver:
                 )
 
         for tool_round in range(4):
-            response = ollama_chat(
-                model=self.conversation_model,
-                messages=messages,
-                tools=tools or None,
-                think=False,
-                options={"num_ctx": 32768, "temperature": 0.2},
-                keep_alive="10m",
-            )
-            messages.append(response.message)
+            if self.conversation_backend == "openai":
+                response = openai_chat(self.conversation_model, messages, tools)
+                messages.append(response.raw_message)
+            else:
+                response = ollama_chat(
+                    model=self.conversation_model,
+                    messages=messages,
+                    tools=tools or None,
+                    think=False,
+                    options={"num_ctx": 32768, "temperature": 0.2},
+                    keep_alive="10m",
+                )
+                messages.append(response.message)
             tool_calls = response.message.tool_calls or []
             if not tool_calls:
                 return sanitise_spoken_text(response.message.content or "")
 
             print(
-                f"[OLLAMA] executing {len(tool_calls)} bounded tool "
+                f"[CONVERSATION] executing {len(tool_calls)} bounded tool "
                 f"call(s), round {tool_round + 1}/4"
             )
             for tool_call in tool_calls:
@@ -1364,13 +1379,14 @@ class VLMObserver:
                             f"Tool {name} failed: "
                             f"{type(tool_error).__name__}: {tool_error}"
                         )
-                messages.append({
-                    "role": "tool",
-                    "tool_name": name,
-                    "content": str(result),
-                })
+                tool_result = {"role": "tool", "content": str(result)}
+                if self.conversation_backend == "openai":
+                    tool_result["tool_call_id"] = tool_call.id
+                else:
+                    tool_result["tool_name"] = name
+                messages.append(tool_result)
 
-        raise RuntimeError("Ollama exceeded the four-round web-tool limit")
+        raise RuntimeError("Conversation backend exceeded the four-round tool limit")
 
 
     def _converse(
@@ -1493,9 +1509,9 @@ class VLMObserver:
             )
             context_text = json.dumps(context, ensure_ascii=False)
             result = ""
-            if self.conversation_model and ollama_chat is not None:
+            if self.conversation_model and (self.conversation_backend == "openai" or ollama_chat is not None):
                 try:
-                    result = self._answer_with_ollama(
+                    result = self._answer_with_conversation_model(
                         system_prompt,
                         context_text,
                         transcript,
@@ -1504,7 +1520,7 @@ class VLMObserver:
                     )
                 except Exception as ollama_error:
                     print(
-                        "[OLLAMA] conversation failed; using local Qwen-VL "
+                        "[CONVERSATION] conversation failed; using local Qwen-VL "
                         f"fallback: {type(ollama_error).__name__}: "
                         f"{ollama_error}"
                     )
@@ -2384,6 +2400,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--robot-api", default=DEFAULT_ROBOT_API)
     parser.add_argument("--vlm-model", default=DEFAULT_VLM_MODEL)
     parser.add_argument(
+        "--conversation-backend", choices=("ollama", "openai"), default="ollama",
+        help="Conversation provider; default: local Ollama/Qwen.",
+    )
+    parser.add_argument(
+        "--openai-model", default="gpt-6-luna",
+        help="OpenAI conversation model (Fast mode); requires OPENAI_API_KEY.",
+    )
+    parser.add_argument(
         "--conversation-model",
         default=DEFAULT_CONVERSATION_MODEL,
         help=(
@@ -2547,6 +2571,8 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    if args.conversation_backend == "openai":
+        require_api_key()
     if args.yolo_fps <= 0:
         raise ValueError("--yolo-fps must be greater than zero")
     if args.face_fps <= 0:
@@ -2618,6 +2644,8 @@ def main() -> None:
         not args.disable_web_search,
         args.asr_model,
         args.asr_word_confidence,
+        args.conversation_backend,
+        args.openai_model,
     )
     robot_session = requests.Session()
     llm_action_broker = FluffyActionBroker(args.robot_api)
