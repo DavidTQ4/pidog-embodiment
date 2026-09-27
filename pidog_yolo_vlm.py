@@ -851,7 +851,7 @@ class VLMObserver:
             "objects, activities, obstacles and anything the person may be "
             "showing you. Do not issue commands or infer the speaker's identity. "
             "YOLO detections are fallible hints. Distances are box-size estimates, "
-            "not measured depth.\n\nYOLO detections from this exact frame:\n"
+            "not measured depth.\n\nRecent YOLO detections close to this frame:\n"
             + json.dumps(detection_payload, ensure_ascii=False)
         )
         rgb = cv2.cvtColor(bgr_frame, cv2.COLOR_BGR2RGB)
@@ -2469,6 +2469,7 @@ def main() -> None:
         + ", ".join(llm_action_broker.allowed_actions)
         + " (maximum two per conversation turn)"
     )
+    print("Voluntary fresh VLM scene-observation tool enabled")
     head_controller = LatestHeadController(args.robot_api)
     head_controller.start()
     camera = LatestFrameCamera(args.stream)
