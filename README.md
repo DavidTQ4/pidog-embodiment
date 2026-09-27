@@ -139,6 +139,38 @@ sudo journalctl -u nox-body -u nox-voice -f
 
 Automatic idle dancing is deliberately not enabled in this first version.
 
+
+### Bounded conversational actions
+
+The desktop Ollama conversation loop can offer Fluffy a small physical gesture
+through `perform_robot_action`. This is a tool call, not free-form command
+text. `fluffy_action_broker.py` converts an allowlisted symbolic name into a
+fixed `nox-body` command and returns the real execution result to the model
+before Fluffy speaks.
+
+Allowed actions are:
+
+```text
+bark, wag_tail, nod, shake_head, think, pant, sit, stand,
+hand_shake, high_five, stretch, push_up, scratch, howling,
+relax_neck, surprise
+```
+
+Safety boundaries:
+
+- at most two proposed actions in one conversation turn;
+- no forward/backward motion, turning, following or tracking controls;
+- no raw servo angles, URLs or arbitrary daemon parameters;
+- all commands pass through the Pi's existing busy/action admission checks;
+- conversational actions are rejected while head tracking or body following
+  is armed;
+- an unknown action is logged and never sent to the robot;
+- the model receives an executed/rejected result and is instructed not to
+  claim success after a rejection.
+
+Normal deterministic voice commands and the local emergency stop remain
+separate from this LLM facility.
+
 ## 🚀 Quick Start
 
 ### Prerequisites
