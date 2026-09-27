@@ -1000,7 +1000,7 @@ class VLMObserver:
         return True
 
     def submit_game_comment(self, game_context: dict, on_complete) -> bool:
-        """Generate one spoken, rules-neutral comment about a finished game."""
+        """Generate a short spoken comment about a current or finished game."""
         with self.lock:
             if self.state.running or not self.conversation_model or ollama_chat is None:
                 return False
@@ -1010,12 +1010,21 @@ class VLMObserver:
         def worker() -> None:
             started = time.perf_counter()
             try:
+                finishing = game_context.get("phase") == "finishing"
+                game_name = (
+                    "chess" if game_context.get("game") == "chess"
+                    else "tic-tac-toe"
+                )
+                moment = "finished game" if finishing else "latest notable move"
+                word_limit = 25 if finishing else 18
                 prompt = (
                     FLUFFY_SELF_KNOWLEDGE
-                    + " Comment on the just-finished tic-tac-toe game in character. "
-                    "Be playful but kind, use plain spoken English, no markdown, "
-                    "and no more than 25 words. The supplied board and result are "
-                    "authoritative; never invent moves or change the outcome."
+                    + f" Comment on this {game_name} {moment} in character. "
+                    "Be playful but kind and directly relevant to the supplied game "
+                    f"state. Use plain spoken English, no markdown, no emoji, and no "
+                    f"more than {word_limit} words. The supplied game state, result, "
+                    "move and evaluation are authoritative; never invent a move or "
+                    "change the outcome."
                 )
                 result = self._answer_with_ollama(
                     prompt,
@@ -1794,6 +1803,8 @@ VOICE_COMMANDS = {
     "tell me what you see": "describe_scene",
     "play tic tac toe": "game_instructions",
     "play tic-tac-toe": "game_instructions",
+    "play chess": "chess_instructions",
+    "play a game of chess": "chess_instructions",
     "stop": "stop",
     "halt": "stop",
     "lie down": "lie_down",
@@ -1814,6 +1825,7 @@ def voice_message_command(message: dict[str, object]) -> str | None:
         "describe_scene",
         "conversation",
         "game_instructions",
+        "chess_instructions",
         "stop",
         "lie_down",
         "stop_and_lie_down",
@@ -2681,7 +2693,7 @@ def main() -> None:
             "FLUFFY_GAME_SERVER"
         )
     else:
-        print("Phone game coordinator enabled: tic-tac-toe")
+        print("Phone game coordinator enabled: tic-tac-toe + Stockfish chess")
 
     print(
         "1-9: select person | 0: clear | C: centre | M: head arm/disarm | "
@@ -2699,7 +2711,8 @@ def main() -> None:
         voice_poller.start()
         print(
             "Voice commands enabled asynchronously: select me | arm head | "
-            "follow me | what do you see | conversation | stop | lie down"
+            "follow me | what do you see | play tic-tac-toe | play chess | "
+            "conversation | stop | lie down"
         )
     try:
         deadline = time.monotonic() + 15
@@ -3739,6 +3752,14 @@ def main() -> None:
                         "Open daves agent tools dot com slash fluffy on your "
                         "phone. Opening the board will queue a new game, and "
                         "you will play first when I am ready.",
+                    )
+                    key = 255
+                elif key == 255 and voice_command == "chess_instructions":
+                    speak_robot(
+                        args.robot_api,
+                        "Open daves agent tools dot com slash fluffy on your "
+                        "phone. Choose a chess difficulty, press play chess, "
+                        "and you will play White when I am ready.",
                     )
                     key = 255
                 elif key == 255 and voice_command == "select_me":
