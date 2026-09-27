@@ -715,6 +715,18 @@ def explicit_requested_action(transcript: str) -> str | None:
     return next((action for phrase, action in phrases if phrase in lowered), None)
 
 
+def fetch_system_status(robot_api: str) -> dict:
+    """Fetch only the fixed read-only Pi status endpoint."""
+    response = requests.get(f"{robot_api.rstrip('/')}/system/status", timeout=(3, 10))
+    if response.status_code == 404:
+        return {"ok": False, "error": "Pi bridge needs updating and restarting to provide system status"}
+    response.raise_for_status()
+    result = response.json()
+    if not isinstance(result, dict):
+        raise ValueError("Pi status response was not an object")
+    return result
+
+
 class VLMObserver:
     """Own Qwen vision plus an optional Ollama conversational agent."""
 
@@ -986,6 +998,7 @@ class VLMObserver:
         action_executor=None,
         scene_observer=None,
         camera_still_provider=None,
+        system_status_provider=None,
     ) -> bool:
         """Transcribe and answer one conversational voice turn asynchronously."""
         with self.lock:
@@ -1008,6 +1021,7 @@ class VLMObserver:
                 action_executor,
                 scene_observer,
                 camera_still_provider,
+                system_status_provider,
             ),
             daemon=True,
         ).start()
@@ -1172,6 +1186,7 @@ class VLMObserver:
         action_executor=None,
         scene_observer=None,
         camera_still_provider=None,
+        system_status_provider=None,
     ) -> str:
         """Run the selected backend through the same bounded robot-tool loop."""
         if self.conversation_backend == "ollama" and ollama_chat is None:
@@ -1202,6 +1217,29 @@ class VLMObserver:
         action_call_count = 0
         executed_actions: set[str] = set()
         scene_call_count = 0
+
+        if system_status_provider is not None:
+            messages[0]["content"] += (
+                " For questions about your battery, CPU usage, CPU temperature, "
+                "memory, disk, uptime or robot health, call get_system_status. "
+                "These readings describe the Raspberry Pi body, not the Windows "
+                "desktop brain. State unavailable readings as unknown; battery "
+                "percentage is approximate and charging is not measured."
+            )
+            status_cache = None
+
+            def get_system_status() -> str:
+                """Read current Raspberry Pi battery voltage and estimated charge, CPU percent and temperature, RAM, disk, uptime, and available robot health diagnostics. Use when asked about system status or health."""
+                nonlocal status_cache
+                if status_cache is None:
+                    try:
+                        status_cache = system_status_provider()
+                    except Exception as exc:
+                        status_cache = {"ok": False, "error": str(exc)}
+                return json.dumps(status_cache, ensure_ascii=False)
+
+            tools.append(get_system_status)
+            available_tools["get_system_status"] = get_system_status
 
         pending_images = []
         still_requested = False
@@ -1346,6 +1384,15 @@ class VLMObserver:
             trigger in lowered_transcript
             for trigger in web_trigger_terms
         )
+        # "Current CPU temperature" needs local telemetry, not online search.
+        if system_status_provider is not None and any(
+            term in lowered_transcript for term in (
+                "your battery", "your cpu", "cpu temperature", "cpu usage",
+                "cpu percent", "your memory", "your disk", "your uptime",
+                "system status", "system health",
+            )
+        ):
+            force_web_search = False
         if force_web_search and "fluffy_web_search" in available_tools:
             print(
                 f"[CONVERSATION] forced/requested web search: "
@@ -1441,6 +1488,7 @@ class VLMObserver:
         action_executor=None,
         scene_observer=None,
         camera_still_provider=None,
+        system_status_provider=None,
     ) -> None:
         started = time.perf_counter()
         try:
@@ -1561,6 +1609,7 @@ class VLMObserver:
                         action_executor,
                         scene_observer,
                         camera_still_provider,
+                        system_status_provider,
                     )
                 except Exception as ollama_error:
                     print(
@@ -3787,6 +3836,7 @@ def main() -> None:
                                     action, robot_context
                                 )
                             ),
+                            system_status_provider=lambda: fetch_system_status(args.robot_api),
                             camera_still_provider=lambda: capture_camera_still(camera),
                             scene_observer=lambda: (
                                 vlm.describe_scene_for_conversation(

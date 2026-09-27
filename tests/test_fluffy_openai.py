@@ -148,3 +148,26 @@ def test_camera_encoding_and_stale_timeout(monkeypatch):
     camera = SimpleNamespace(latest=lambda: (1, frame, None))
     with pytest.raises(RuntimeError, match="No fresh camera"):
         fluffy_camera.capture_camera_still(camera)
+
+@pytest.mark.parametrize("backend", ["openai", "ollama"])
+def test_system_status_tool_both_backends(backend):
+    import json
+    import os
+    calls, readings = [], []
+    def chat(*args, **kwargs):
+        messages = args[1] if args else kwargs["messages"]
+        tools = args[2] if args else kwargs["tools"]
+        assert "get_system_status" in [f.__name__ for f in tools]
+        calls.append(list(messages))
+        tool_calls = [] if len(calls) == 3 else [SimpleNamespace(
+            id="health", function=SimpleNamespace(name="get_system_status", arguments={}))]
+        return SimpleNamespace(message=SimpleNamespace(content="Battery is about 50 percent", tool_calls=tool_calls),
+                               raw_message={"role": "assistant", "content": None})
+    method = load_method("_answer_with_conversation_model", dict(
+        ollama_chat=chat, openai_chat=chat, json=json, os=os, sanitise_spoken_text=lambda t: t))
+    observer = SimpleNamespace(conversation_backend=backend, conversation_model="model",
+                               conversation_history=[], web_search_enabled=False)
+    method(observer, "system", "{}", "How is your battery?", system_status_provider=lambda: (
+        readings.append(True) or {"battery": {"estimated_percent": 50}, "cpu_temperature_c": 42}))
+    assert readings == [True]
+    assert json.loads(calls[1][-1]["content"])["cpu_temperature_c"] == 42

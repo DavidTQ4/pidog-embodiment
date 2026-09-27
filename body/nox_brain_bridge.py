@@ -24,6 +24,8 @@ import threading
 import traceback
 import urllib.request
 import signal
+import shutil
+import math
 
 # Behavior engine reference (set in main())
 _behavior_engine = None
@@ -352,6 +354,79 @@ def get_sensor_data():
     return status
 
 
+def collect_system_status():
+    """Read Pi health on demand without new packages or shell commands."""
+    result = {"source": "raspberry_pi", "sampled_at_unix": time.time(),
+              "cpu_percent": None, "cpu_temperature_c": None,
+              "memory": None, "disk": None, "uptime_s": None}
+    errors = {}
+
+    def read_cpu():
+        # guest counters are already included in user/nice; do not double count.
+        values = [int(v) for v in Path("/proc/stat").read_text().splitlines()[0].split()[1:9]]
+        return sum(values), values[3] + values[4]
+
+    try:
+        total1, idle1 = read_cpu()
+        time.sleep(0.2)
+        total2, idle2 = read_cpu()
+        if total2 > total1:
+            result["cpu_percent"] = round(max(0, min(100, 100 * (1 - (idle2 - idle1) / (total2 - total1)))), 1)
+        else:
+            errors["cpu_percent"] = "CPU counters did not advance"
+    except (OSError, ValueError, IndexError) as exc:
+        errors["cpu_percent"] = str(exc)
+    try:
+        result["cpu_temperature_c"] = round(float(Path("/sys/class/thermal/thermal_zone0/temp").read_text()) / 1000, 1)
+    except (OSError, ValueError) as exc:
+        errors["cpu_temperature_c"] = str(exc)
+    try:
+        mem = {line.split(":")[0]: int(line.split()[1]) * 1024
+               for line in Path("/proc/meminfo").read_text().splitlines()}
+        total, available = mem["MemTotal"], mem["MemAvailable"]
+        result["memory"] = {"total_bytes": total, "available_bytes": available,
+                            "used_percent": round(100 * (total - available) / total, 1)}
+    except (OSError, ValueError, KeyError, IndexError, ZeroDivisionError) as exc:
+        errors["memory"] = str(exc)
+    try:
+        disk = shutil.disk_usage("/")
+        result["disk"] = {"total_bytes": disk.total, "free_bytes": disk.free,
+                          "used_percent": round(100 * disk.used / disk.total, 1)}
+    except (OSError, ZeroDivisionError) as exc:
+        errors["disk"] = str(exc)
+    try:
+        result["uptime_s"] = float(Path("/proc/uptime").read_text().split()[0])
+    except (OSError, ValueError, IndexError) as exc:
+        errors["uptime_s"] = str(exc)
+
+    sensors = get_sensor_data()
+    voltage = sensors.get("battery_v")
+    valid = isinstance(voltage, (int, float)) and not isinstance(voltage, bool) and math.isfinite(voltage) and voltage >= 0
+    result["battery"] = {
+        "voltage_v": voltage if valid else None,
+        "estimated_percent": max(0, min(100, round((voltage - 6.0) / 2.4 * 100))) if valid and voltage > 1 else None,
+        "servo_power_missing": voltage <= 1 if valid else None,
+        "charging": None,
+        "note": "Percentage is a rough voltage estimate; charging state is not measured.",
+    }
+    if not valid:
+        errors["battery"] = sensors.get("battery_error") or sensors.get("error") or "Battery reading unavailable"
+    # Forward only known diagnostics, never memory, face data or credentials.
+    result["robot"] = {key: sensors[key] for key in (
+        "distance_cm", "distance_valid", "distance_age_s", "posture", "i2c"
+    ) if key in sensors}
+    if sensors.get("error"):
+        errors["robot"] = sensors["error"]
+    if _behavior_engine:
+        state = _behavior_engine.get_state()
+        result["behavior"] = {key: state[key] for key in (
+            "state", "low_battery", "servo_power_missing", "patrol_enabled"
+        ) if key in state}
+    result["errors"] = errors
+    result["ok"] = not errors
+    return result
+
+
 # ─── HTTP Request Handler ───
 class BridgeHandler(BaseHTTPRequestHandler):
     
@@ -391,7 +466,10 @@ class BridgeHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         path = self.path.split("?")[0]
         
-        if path == "/status":
+        if path == "/system/status":
+            self._send_json(collect_system_status())
+
+        elif path == "/status":
             # System status
             sensors = get_sensor_data()
             state = perception.snapshot()
@@ -621,7 +699,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 "ok": True,
                 "version": "sprint5",
                 "endpoints": {
-                    "GET": ["/status", "/perception", "/photo", "/look", "/faces",
+                    "GET": ["/status", "/system/status", "/perception", "/photo", "/look", "/faces",
                             "/voice/inbox", "/voice/echo_until", "/memory/recent",
                             "/memory/stats", "/state", "/scan", "/scan/sweep",
                             "/sensors", "/motion/status", "/capabilities",

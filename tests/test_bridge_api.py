@@ -132,3 +132,30 @@ def test_behavior_stop_surfaces_a_failed_drain(server_port, monkeypatch):
     assert body["stopped"]
     assert "Connection refused" in body["motion_error"]
     assert "motion_frames_dropped" not in body
+
+
+def test_system_status_endpoint(server_port, monkeypatch):
+    monkeypatch.setattr(bridge, "collect_system_status", lambda: {"ok": True, "cpu_percent": 25})
+    with urllib.request.urlopen(f"http://127.0.0.1:{server_port}/system/status") as response:
+        assert json.load(response)["cpu_percent"] == 25
+
+
+@pytest.mark.parametrize("voltage,expected,missing", [(7.2, 50, False), (0, None, True), (None, None, None), ("error", None, None)])
+def test_system_health_readings(monkeypatch, voltage, expected, missing):
+    from types import SimpleNamespace
+    cpu = iter(["cpu 100 0 100 800 0 0 0 0 0 0", "cpu 120 0 130 850 0 0 0 0 0 0"])
+    def read(path):
+        return {"/proc/meminfo": "MemTotal: 1000 kB\nMemAvailable: 250 kB\n",
+                "/proc/uptime": "1234.5 100", "/sys/class/thermal/thermal_zone0/temp": "42500"}.get(path.as_posix(), "") if path.as_posix() != "/proc/stat" else next(cpu)
+    monkeypatch.setattr(bridge.Path, "read_text", read)
+    monkeypatch.setattr(bridge.time, "sleep", lambda _: None)
+    monkeypatch.setattr(bridge.shutil, "disk_usage", lambda _: SimpleNamespace(total=1000, used=400, free=600))
+    monkeypatch.setattr(bridge, "get_sensor_data", lambda: {"battery_v": voltage})
+    monkeypatch.setattr(bridge, "_behavior_engine", None)
+    data = bridge.collect_system_status()
+    assert data["cpu_percent"] == 50
+    assert data["cpu_temperature_c"] == 42.5
+    assert data["memory"]["used_percent"] == 75
+    assert data["battery"]["estimated_percent"] == expected
+    assert data["battery"]["servo_power_missing"] is missing
+    assert data["battery"]["charging"] is None
