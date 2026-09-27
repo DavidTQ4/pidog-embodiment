@@ -220,6 +220,7 @@ class GrooveController:
     def _dance_loop(self) -> None:
         phase = 1
         next_pose = time.monotonic()
+        centred_waiting = True
         while not self._stop_event.wait(0.02):
             with self._lock:
                 if not self._active:
@@ -227,8 +228,15 @@ class GrooveController:
                 bpm = self._bpm
                 beat_period = self._beat_period
             if bpm is None:
+                if not centred_waiting:
+                    try:
+                        self._send({"cmd": "groove_stop"})
+                    except Exception as exc:
+                        print(f"[groove] settle after music failed: {exc}", flush=True)
+                    centred_waiting = True
                 continue
 
+            centred_waiting = False
             now = time.monotonic()
             if now < next_pose:
                 continue
