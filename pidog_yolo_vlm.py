@@ -72,6 +72,7 @@ from transformers import (
 )
 from ultralytics import YOLO
 
+from fluffy_action_broker import ACTION_SPECS, FluffyActionBroker
 from pidog_face_identity import (
     DEFAULT_IDENTITY_MARGIN,
     FaceIdentityEngine,
@@ -836,6 +837,7 @@ class VLMObserver:
         fallback_text: str,
         robot_context: dict[str, object],
         on_complete=None,
+        action_executor=None,
     ) -> bool:
         """Transcribe and answer one conversational voice turn asynchronously."""
         with self.lock:
@@ -855,6 +857,7 @@ class VLMObserver:
                 fallback_text,
                 dict(robot_context),
                 on_complete,
+                action_executor,
             ),
             daemon=True,
         ).start()
@@ -972,6 +975,7 @@ class VLMObserver:
         system_prompt: str,
         context_text: str,
         transcript: str,
+        action_executor=None,
     ) -> str:
         """Run a bounded Ollama tool loop for one conversational response."""
         if ollama_chat is None:
@@ -999,12 +1003,32 @@ class VLMObserver:
 
         tools = []
         available_tools = {}
+        action_call_count = 0
+
+        if action_executor is not None:
+            def perform_robot_action(action: str) -> str:
+                """Perform one safe stationary robot-dog action. Valid actions: bark, wag_tail, nod, shake_head, think, pant, sit, stand, hand_shake, high_five, stretch, push_up, scratch, howling, relax_neck, surprise."""
+                nonlocal action_call_count
+                if action_call_count >= FluffyActionBroker.MAX_ACTIONS_PER_TURN:
+                    return json.dumps({
+                        "ok": False,
+                        "executed": False,
+                        "action": str(action),
+                        "reason": "maximum of two LLM actions per turn reached",
+                    })
+                action_call_count += 1
+                result = action_executor(action)
+                return json.dumps(result, ensure_ascii=False)
+
+            tools.append(perform_robot_action)
+            available_tools["perform_robot_action"] = perform_robot_action
+
         if self.web_search_enabled and os.environ.get("OLLAMA_API_KEY"):
-            tools = [fluffy_web_search, fluffy_web_fetch]
-            available_tools = {
+            tools.extend([fluffy_web_search, fluffy_web_fetch])
+            available_tools.update({
                 "fluffy_web_search": fluffy_web_search,
                 "fluffy_web_fetch": fluffy_web_fetch,
-            }
+            })
 
         # Small local models do not always elect to call a tool even when the
         # question plainly requires live information. Force retrieval for
@@ -1080,7 +1104,7 @@ class VLMObserver:
                 return str(response.message.content or "").strip()
 
             print(
-                f"[OLLAMA] executing {len(tool_calls)} information tool "
+                f"[OLLAMA] executing {len(tool_calls)} bounded tool "
                 f"call(s), round {tool_round + 1}/4"
             )
             for tool_call in tool_calls:
@@ -1112,6 +1136,7 @@ class VLMObserver:
         fallback_text: str,
         robot_context: dict[str, object],
         on_complete=None,
+        action_executor=None,
     ) -> None:
         started = time.perf_counter()
         try:
@@ -1194,9 +1219,17 @@ class VLMObserver:
                 "distance and completed actions in the supplied robot state. "
                 "A visible identity is not proof of who is speaking. Never claim "
                 "that a requested action happened unless its confirmed state or "
-                "result says so. You have no authority to invent or directly "
-                "execute movement. If asked to do something outside the existing "
-                "voice commands, explain that briefly. Reply in plain spoken "
+                "tool result says so. You may use perform_robot_action for a "
+                "small stationary gesture when the person explicitly requests "
+                "one, or for at most one contextually appropriate expressive "
+                "gesture. Never call it merely to fill silence or on every reply. "
+                "Only these actions exist: "
+                + ", ".join(ACTION_SPECS)
+                + ". Never request locomotion, tracking, following, raw servo "
+                "angles or arbitrary robot commands. Do not write action syntax "
+                "in your spoken response: either call the tool or omit the action. "
+                "If the tool rejects an action, state that it could not be done "
+                "without claiming success. Reply in plain spoken "
                 "English with no markdown. Normally answer in one short sentence "
                 "of no more than 35 words; use two only when genuinely needed. "
                 "Use web tools when the question depends on current, changing "
@@ -1214,6 +1247,7 @@ class VLMObserver:
                         system_prompt,
                         context_text,
                         transcript,
+                        action_executor,
                     )
                 except Exception as ollama_error:
                     print(
@@ -2311,6 +2345,15 @@ def main() -> None:
         args.asr_word_confidence,
     )
     robot_session = requests.Session()
+    llm_action_broker = FluffyActionBroker(
+        args.robot_api,
+        session=robot_session,
+    )
+    print(
+        "LLM stationary actions enabled: "
+        + ", ".join(llm_action_broker.allowed_actions)
+        + " (maximum two per conversation turn)"
+    )
     head_controller = LatestHeadController(args.robot_api)
     head_controller.start()
     camera = LatestFrameCamera(args.stream)
@@ -3357,6 +3400,9 @@ def main() -> None:
                             on_complete=lambda result: speak_robot(
                                 args.robot_api,
                                 result,
+                            ),
+                            action_executor=lambda action: (
+                                llm_action_broker.execute(action, robot_context)
                             ),
                         )
                         if accepted:
