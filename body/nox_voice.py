@@ -39,6 +39,10 @@ PHRASE_TO_COMMAND = {
     "what do you see": "describe_scene",
     "what can you see": "describe_scene",
     "tell me what you see": "describe_scene",
+    "play tic tac toe": "game_instructions",
+    "play tic-tac-toe": "game_instructions",
+    "let us play tic tac toe": "game_instructions",
+    "let's play tic tac toe": "game_instructions",
 
     # Safety and posture.
     "stop": "stop",
