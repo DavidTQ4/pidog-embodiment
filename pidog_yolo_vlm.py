@@ -73,6 +73,7 @@ from transformers import (
 from ultralytics import YOLO
 
 from fluffy_action_broker import ACTION_SPECS, FluffyActionBroker
+from fluffy_games import FluffyGameCoordinator
 from pidog_face_identity import (
     DEFAULT_IDENTITY_MARGIN,
     FaceIdentityEngine,
@@ -945,6 +946,41 @@ class VLMObserver:
         ).start()
         return True
 
+    def submit_game_comment(self, game_context: dict, on_complete) -> bool:
+        """Generate one spoken, rules-neutral comment about a finished game."""
+        with self.lock:
+            if self.state.running or not self.conversation_model or ollama_chat is None:
+                return False
+            self.state.running = True
+            self.state.error = None
+            self.state.text = "Thinking about the game..."
+        def worker() -> None:
+            started = time.perf_counter()
+            try:
+                prompt = (
+                    FLUFFY_SELF_KNOWLEDGE
+                    + " Comment on the just-finished tic-tac-toe game in character. "
+                    "Be playful but kind, use plain spoken English, no markdown, "
+                    "and no more than 25 words. The supplied board and result are "
+                    "authoritative; never invent moves or change the outcome."
+                )
+                result = self._answer_with_ollama(
+                    prompt,
+                    json.dumps(game_context, ensure_ascii=False),
+                    "Give your end-of-game comment.",
+                )
+                with self.lock:
+                    self.state.text = result
+                    self.state.seconds = time.perf_counter() - started
+                    self.state.running = False
+                on_complete(result)
+            except Exception as exc:
+                with self.lock:
+                    self.state.running = False
+                    self.state.error = f"{type(exc).__name__}: {exc}"
+        threading.Thread(target=worker, daemon=True).start()
+        return True
+
     def _get_transcriber(self):
         if WhisperModel is None:
             raise RuntimeError(
@@ -1665,6 +1701,8 @@ VOICE_COMMANDS = {
     "what do you see": "describe_scene",
     "what can you see": "describe_scene",
     "tell me what you see": "describe_scene",
+    "play tic tac toe": "game_instructions",
+    "play tic-tac-toe": "game_instructions",
     "stop": "stop",
     "halt": "stop",
     "lie down": "lie_down",
@@ -1684,6 +1722,7 @@ def voice_message_command(message: dict[str, object]) -> str | None:
         "follow_me",
         "describe_scene",
         "conversation",
+        "game_instructions",
         "stop",
         "lie_down",
         "stop_and_lie_down",
@@ -2514,6 +2553,28 @@ def main() -> None:
     voice_poller: VoiceCommandPoller | None = None
     last_voice_error_log_time = 0.0
     voice_event_history: deque[dict[str, object]] = deque(maxlen=12)
+    game_lock = {"active": False}
+
+    def set_game_lock(active: bool) -> None:
+        game_lock["active"] = active
+
+    game_coordinator = FluffyGameCoordinator.from_environment(
+        is_idle=lambda: (
+            not vlm.snapshot().running
+            and not movement_enabled
+            and not turning_enabled
+        ),
+        speak=lambda text: speak_robot(args.robot_api, text),
+        on_game_lock=set_game_lock,
+        commentary=lambda context, done: vlm.submit_game_comment(context, done),
+    )
+    if game_coordinator is None:
+        print(
+            "Phone games disabled: set FLUFFY_GAME_SECRET and optionally "
+            "FLUFFY_GAME_SERVER"
+        )
+    else:
+        print("Phone game coordinator enabled: tic-tac-toe")
 
     print(
         "1-9: select person | 0: clear | C: centre | M: head arm/disarm | "
@@ -2591,6 +2652,11 @@ def main() -> None:
             last_sequence = sequence
 
             now = time.perf_counter()
+            if game_coordinator is not None:
+                game_coordinator.tick()
+                if game_lock["active"]:
+                    movement_enabled = False
+                    turning_enabled = False
             head_failure = head_controller.consume_failure()
             if head_failure is not None:
                 failure_count, failure_reason = head_failure
@@ -3507,6 +3573,11 @@ def main() -> None:
                             "recent_voice_events": list(
                                 voice_event_history
                             ),
+                            "game": (
+                                game_coordinator.context()
+                                if game_coordinator is not None
+                                else None
+                            ),
                         }
                         accepted = vlm.submit_conversation(
                             conversation_audio,
@@ -3517,8 +3588,12 @@ def main() -> None:
                                 args.robot_api,
                                 result,
                             ),
-                            action_executor=lambda action: (
-                                llm_action_broker.execute(action, robot_context)
+                            action_executor=(
+                                None
+                                if game_lock["active"]
+                                else lambda action: llm_action_broker.execute(
+                                    action, robot_context
+                                )
                             ),
                             scene_observer=lambda: (
                                 vlm.describe_scene_for_conversation(
@@ -3551,6 +3626,14 @@ def main() -> None:
                         "Voice scene request accepted: analysing the newest "
                         "camera frame and preparing a spoken response"
                     )
+                elif key == 255 and voice_command == "game_instructions":
+                    speak_robot(
+                        args.robot_api,
+                        "Open daves agent tools dot com slash fluffy on your "
+                        "phone. Opening the board will queue a new game, and "
+                        "you will play first when I am ready.",
+                    )
+                    key = 255
                 elif key == 255 and voice_command == "select_me":
                     people = selectable_people(yolo_state.detections)
                     recognised_slots = [
@@ -3705,6 +3788,9 @@ def main() -> None:
                     pitch = 0.0
                     head_reference_known = True
                     print("Head centred; movement remains disarmed")
+            if game_lock["active"] and key in (ord("m"), ord("t")):
+                print("Head tracking and body following are locked during the game")
+                key = 255
             if key == ord("m"):
                 if movement_enabled:
                     movement_enabled = False
@@ -3855,6 +3941,8 @@ def main() -> None:
                             except Exception as exc:
                                 print(f"Could not speak busy response: {exc}")
     finally:
+        if game_coordinator is not None:
+            game_coordinator.close()
         if voice_poller is not None:
             voice_poller.stop()
         head_controller.stop()
