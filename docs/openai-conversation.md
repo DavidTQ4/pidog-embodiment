@@ -74,7 +74,17 @@ This switches spoken conversation and game commentary. YOLO, Qwen-VL vision,
 Whisper transcription, speech output, and the robot action broker stay as they
 are. The existing bounded tools, conversation history, and action limits apply
 to either backend. OpenAI receives conversation text and verified robot context,
-including scene descriptions when requested; camera images remain local.
+including scene descriptions when requested. OpenAI can also call
+`request_camera_still` to receive a fresh JPEG directly, without Qwen-VL
+interpreting it first. This is available automatically in OpenAI mode.
+Try asking "What am I holding?" or "Read the label I am showing you."
+
+The tool waits up to two seconds for a new frame from the existing stream,
+limits the longest edge to 1280 pixels, and sends at most one still per turn.
+Stills stay in memory and are not saved to disk or conversation history; they
+are sent to OpenAI for the current turn. A stalled camera returns a tool error.
+The local `observe_scene` tool remains available, and Qwen mode never receives
+the direct-image tool. No Pi changes or extra startup flags are required.
 
 Web search still uses the existing Ollama web tools and `OLLAMA_API_KEY`.
 `--disable-web-search` disables those tools for either backend.

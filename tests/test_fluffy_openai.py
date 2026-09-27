@@ -95,3 +95,56 @@ def test_cli_defaults_and_openai_selection(monkeypatch):
     args = namespace["parse_args"]()
     assert args.openai_model == "gpt-6-luna"
     assert args.conversation_backend == "openai"
+
+@pytest.mark.parametrize("backend,fail", [("openai", False), ("openai", True), ("ollama", False)])
+def test_direct_camera_tool(backend, fail):
+    import json
+    import os
+    turns, captures = [], []
+    def capture():
+        captures.append(True)
+        if fail:
+            raise RuntimeError("camera stalled")
+        return "data:image/jpeg;base64,dGVzdA=="
+    def chat(*args, **kwargs):
+        messages = args[1] if args else kwargs["messages"]
+        tools = args[2] if args else kwargs["tools"]
+        names = [f.__name__ for f in tools or []]
+        assert ("request_camera_still" in names) == (backend == "openai")
+        turns.append(list(messages))
+        calls = []
+        if backend == "openai" and len(turns) < 3:
+            calls = [SimpleNamespace(id="still", function=SimpleNamespace(name="request_camera_still", arguments={}))]
+        return SimpleNamespace(message=SimpleNamespace(content="Answer", tool_calls=calls),
+                               raw_message={"role": "assistant", "content": "Answer"})
+    method = load_method("_answer_with_conversation_model", dict(
+        ollama_chat=chat, openai_chat=chat, os=os, json=json, sanitise_spoken_text=lambda text: text))
+    observer = SimpleNamespace(conversation_backend=backend, conversation_model="model",
+                               conversation_history=[], web_search_enabled=False)
+    assert method(observer, "system", "{}", "Read this label", camera_still_provider=capture) == "Answer"
+    assert len(captures) == (1 if backend == "openai" else 0)
+    if backend == "openai":
+        images = [m for m in turns[-1] if isinstance(m.get("content"), list)]
+        assert len(images) == (0 if fail else 1)
+        if not fail:
+            assert images[0]["content"][1]["image_url"]["url"].startswith("data:image/jpeg;base64,")
+        assert "Only one camera still" in turns[-1][-1]["content"]
+
+
+def test_camera_encoding_and_stale_timeout(monkeypatch):
+    import base64
+    import cv2
+    import numpy as np
+    import fluffy_camera
+    frame = np.zeros((1600, 2000, 3), dtype=np.uint8)
+    samples = iter([(1, frame, None), (2, frame, None)])
+    camera = SimpleNamespace(latest=lambda: next(samples))
+    url = fluffy_camera.capture_camera_still(camera)
+    decoded = cv2.imdecode(np.frombuffer(base64.b64decode(url.split(",")[1]), dtype=np.uint8), cv2.IMREAD_COLOR)
+    assert decoded.shape[:2] == (1024, 1280)
+    times = iter([0, 0, 3])
+    monkeypatch.setattr(fluffy_camera.time, "monotonic", lambda: next(times))
+    monkeypatch.setattr(fluffy_camera.time, "sleep", lambda _: None)
+    camera = SimpleNamespace(latest=lambda: (1, frame, None))
+    with pytest.raises(RuntimeError, match="No fresh camera"):
+        fluffy_camera.capture_camera_still(camera)
