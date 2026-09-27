@@ -43,6 +43,10 @@ PHRASE_TO_COMMAND = {
     "play tic-tac-toe": "game_instructions",
     "let us play tic tac toe": "game_instructions",
     "let's play tic tac toe": "game_instructions",
+    "play chess": "chess_instructions",
+    "play a game of chess": "chess_instructions",
+    "let us play chess": "chess_instructions",
+    "let's play chess": "chess_instructions",
 
     # Safety and posture.
     "stop": "stop",
