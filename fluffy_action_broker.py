@@ -77,6 +77,7 @@ class FluffyActionBroker:
         minimum_interval_seconds: float = 0.35,
     ):
         self.robot_api = robot_api.rstrip("/")
+        self._owns_session = session is None
         self.session = session or requests.Session()
         self.request_timeout = request_timeout
         self.minimum_interval_seconds = minimum_interval_seconds
@@ -86,6 +87,10 @@ class FluffyActionBroker:
     @property
     def allowed_actions(self) -> tuple[str, ...]:
         return tuple(ACTION_SPECS)
+
+    def close(self) -> None:
+        if self._owns_session:
+            self.session.close()
 
     def execute(
         self,
