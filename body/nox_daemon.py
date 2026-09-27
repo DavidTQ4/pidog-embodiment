@@ -851,6 +851,59 @@ def cmd_head_ema(yaw=0, roll=0, pitch=0, internal=False):
         )
     return {"ok": True, "head": pos}
 
+def cmd_groove_pose(yaw=0, roll=0, pitch=0, tail=0):
+    """Apply one bounded head/tail dance pose without touching the legs."""
+    _mark_activity()
+    if _servo_pwm_disabled:
+        return {"ok": False, "error": "servos sleeping"}
+
+    yaw = max(-45.0, min(45.0, float(yaw)))
+    roll = max(-30.0, min(30.0, float(roll)))
+    pitch = max(-20.0, min(20.0, float(pitch)))
+    tail = max(-45.0, min(45.0, float(tail)))
+    with dog_lock:
+        dead = _dead_action_threads()
+        if "head_thread" in dead or "tail_thread" in dead:
+            return {
+                "ok": False,
+                "error": f"dance action thread unhealthy: {', '.join(dead)}",
+            }
+        dog.head_move(
+            [[yaw, roll, pitch]],
+            immediately=True,
+            speed=HEAD_TRACKING_SPEED,
+        )
+        dog.tail_move([[tail]], immediately=True, speed=90)
+    _smooth_head.snap_to(yaw, roll, pitch)
+    return {
+        "ok": True,
+        "groove_pose": {
+            "head": [yaw, roll, pitch],
+            "tail": tail,
+        },
+    }
+
+
+def cmd_groove_stop():
+    """Discard pending dance frames and return head/tail to neutral."""
+    with dog_lock:
+        cleared_frames = _clear_action_buffers(
+            ("head_action_buffer", "tail_action_buffer")
+        )
+        dog.head_move(
+            [[0, 0, 0]],
+            immediately=True,
+            speed=HEAD_TRACKING_SPEED,
+        )
+        dog.tail_move([[0]], immediately=True, speed=80)
+    _smooth_head.snap_to(0, 0, 0)
+    return {
+        "ok": True,
+        "groove": "stopped",
+        "cleared_dance_frames": cleared_frames,
+    }
+
+
 _VALID_RGB_STYLES = {"monochromatic", "breath", "boom", "bark", "speak", "listen"}
 
 def cmd_rgb(r=128, g=0, b=255, mode="breath", bps=0.8):
@@ -1535,6 +1588,8 @@ COMMANDS = {
     "motion_status": lambda args: cmd_motion_status(),
     "head": lambda args: cmd_head(args.get("yaw", 0), args.get("roll", 0), args.get("pitch", 0), args.get("smooth", True), internal=args.get("_internal", False)),
     "head_ema": lambda args: cmd_head_ema(args.get("yaw", 0), args.get("roll", 0), args.get("pitch", 0), internal=args.get("_internal", False)),
+    "groove_pose": lambda args: cmd_groove_pose(args.get("yaw", 0), args.get("roll", 0), args.get("pitch", 0), args.get("tail", 0)),
+    "groove_stop": lambda args: cmd_groove_stop(),
     "rgb": lambda args: cmd_rgb(args.get("r", 128), args.get("g", 0), args.get("b", 255), args.get("mode", "breath"), args.get("bps", 0.8)),
     "photo": lambda args: cmd_photo(args.get("path")),
     "speak": lambda args: cmd_speak(args.get("text", "")),
