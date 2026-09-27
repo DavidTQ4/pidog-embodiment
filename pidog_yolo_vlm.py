@@ -1296,7 +1296,7 @@ class VLMObserver:
         )
         if force_web_search and "fluffy_web_search" in available_tools:
             print(
-                f"[OLLAMA] forced web search for time-sensitive question: "
+                f"[OLLAMA] forced/requested web search: "
                 f"{transcript!r}"
             )
             try:
@@ -1312,18 +1312,16 @@ class VLMObserver:
                     ),
                 })
             except Exception as search_error:
-                messages.append({
-                    "role": "system",
-                    "content": (
-                        "The required live web search failed. Tell the person "
-                        "you could not check current information; do not guess. "
-                        f"Technical failure: {type(search_error).__name__}: "
-                        f"{search_error}"
-                    ),
-                })
                 print(
                     "[OLLAMA] forced web search failed: "
                     f"{type(search_error).__name__}: {search_error}"
+                )
+                # Do not ask the small local model to relay this failure: it
+                # has previously ignored that instruction and promised to
+                # search anyway. Return a truthful, directly speakable result.
+                return (
+                    "I couldn't access online search just now, so I can't "
+                    "verify that for you."
                 )
 
         for tool_round in range(4):
