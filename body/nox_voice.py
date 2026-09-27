@@ -25,6 +25,8 @@ from pathlib import Path
 
 from vosk import KaldiRecognizer, Model, SetLogLevel
 
+from nox_groove import GrooveController
+
 
 SAMPLE_RATE = 16000
 WAKE_WORDS = ("fluffy",)
@@ -70,6 +72,10 @@ PHRASE_TO_COMMAND = {
     "nod": "nod",
     "shake your head": "shake_head",
     "shake head": "shake_head",
+    "dance": "dance",
+    "start dancing": "dance",
+    "dance with me": "dance",
+    "stop dancing": "stop_dancing",
 }
 
 LOCAL_MOVE_ACTIONS = {
@@ -464,6 +470,9 @@ def main() -> int:
     if args.stop_without_wake:
         print("[voice] Bare 'stop' is enabled as a fail-safe", flush=True)
 
+    groove = GrooveController(
+        lambda payload: daemon_json(args.daemon_host, args.daemon_port, payload)
+    )
     process = subprocess.Popen(arecord_command, stdout=subprocess.PIPE)
     stopping = False
 
@@ -503,6 +512,7 @@ def main() -> int:
                 continue
 
             chunk = apply_gain(chunk, args.gain)
+            groove.feed(chunk)
             utterance_audio.extend(chunk)
             if len(utterance_audio) > relay_audio_window_bytes:
                 del utterance_audio[:-relay_audio_window_bytes]
@@ -632,7 +642,28 @@ def main() -> int:
             sound_direction = (
                 read_sound_direction(args) if has_wake_word else None
             )
-            local_action, local_result = run_local_action(args, command)
+            # Dance is managed by the microphone owner, while all actual
+            # servo writes still pass through nox-body. Safety/posture commands
+            # always cancel dancing before they act.
+            if command == "dance":
+                local_action = "groove"
+                local_result = groove.start(
+                    acknowledgement_seconds=1.25 if args.bark_ack else 0.25
+                )
+            elif command == "stop_dancing":
+                local_action = "groove_stop"
+                local_result = groove.stop()
+            else:
+                if command in {
+                    "stop",
+                    "lie_down",
+                    "stop_and_lie_down",
+                    "doze_off",
+                    "sit",
+                    "stand",
+                }:
+                    groove.stop()
+                local_action, local_result = run_local_action(args, command)
             relayed = relay_command(
                 args,
                 text,
@@ -665,6 +696,7 @@ def main() -> int:
                 flush=True,
             )
     finally:
+        groove.stop()
         if process.poll() is None:
             process.terminate()
             try:
