@@ -40,6 +40,7 @@ except ImportError:
 import textwrap
 import threading
 import time
+import unicodedata
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -660,6 +661,57 @@ def fluffy_web_fetch(url: str) -> str:
     return str(result)[:16000]
 
 
+def sanitise_spoken_text(text: str) -> str:
+    """Remove emoji/control glyphs that Windows SAPI reads as character names."""
+    cleaned = "".join(
+        character
+        for character in str(text)
+        if unicodedata.category(character) not in {"So", "Sk", "Cf", "Cc"}
+    )
+    cleaned = re.sub(r"[*_`#]+", "", cleaned)
+    return " ".join(cleaned.split()).strip()
+
+
+def explicit_requested_action(transcript: str) -> str | None:
+    """Resolve a clearly requested stationary gesture without trusting prose."""
+    lowered = " ".join(transcript.lower().strip().split())
+    request_markers = (
+        "please ", "can you ", "could you ", "would you ", "will you ",
+        "do a ", "do some ", "give me ", "show me ", "perform ",
+    )
+    if not (
+        lowered.startswith(request_markers)
+        or any(f" {marker}" in f" {lowered}" for marker in request_markers)
+    ):
+        return None
+    phrases = (
+        ("shake your head", "shake_head"),
+        ("shake head", "shake_head"),
+        ("wag your tail", "wag_tail"),
+        ("wag tail", "wag_tail"),
+        ("give me your paw", "hand_shake"),
+        ("shake paws", "hand_shake"),
+        ("high five", "high_five"),
+        ("push ups", "push_up"),
+        ("push up", "push_up"),
+        ("relax your neck", "relax_neck"),
+        ("relax neck", "relax_neck"),
+        ("look surprised", "surprise"),
+        ("surprise me", "surprise"),
+        ("howl", "howling"),
+        ("bark", "bark"),
+        ("paw", "hand_shake"),
+        ("nod", "nod"),
+        ("pant", "pant"),
+        ("sit", "sit"),
+        ("stand", "stand"),
+        ("stretch", "stretch"),
+        ("scratch", "scratch"),
+        ("think", "think"),
+    )
+    return next((action for phrase, action in phrases if phrase in lowered), None)
+
+
 class VLMObserver:
     """Own Qwen vision plus an optional Ollama conversational agent."""
 
@@ -1123,6 +1175,7 @@ class VLMObserver:
         tools = []
         available_tools = {}
         action_call_count = 0
+        executed_actions: set[str] = set()
         scene_call_count = 0
 
         if scene_observer is not None:
@@ -1156,6 +1209,14 @@ class VLMObserver:
             def perform_robot_action(action: str) -> str:
                 """Perform one safe stationary robot-dog action. Valid actions: bark, wag_tail, nod, shake_head, think, pant, sit, stand, hand_shake, high_five, stretch, push_up, scratch, howling, relax_neck, surprise."""
                 nonlocal action_call_count
+                action = str(action)
+                if action in executed_actions:
+                    return json.dumps({
+                        "ok": False,
+                        "executed": False,
+                        "action": action,
+                        "reason": "that action was already attempted this turn",
+                    })
                 if action_call_count >= FluffyActionBroker.MAX_ACTIONS_PER_TURN:
                     return json.dumps({
                         "ok": False,
@@ -1165,10 +1226,33 @@ class VLMObserver:
                     })
                 action_call_count += 1
                 result = action_executor(action)
+                executed_actions.add(action)
                 return json.dumps(result, ensure_ascii=False)
 
             tools.append(perform_robot_action)
             available_tools["perform_robot_action"] = perform_robot_action
+
+            # Small local models sometimes promise an explicitly requested
+            # gesture in prose instead of emitting a structured tool call.
+            # Execute only a clearly requested allowlisted action here, then
+            # give the verified result to the model so its answer stays true.
+            requested_action = explicit_requested_action(transcript)
+            if requested_action is not None:
+                print(
+                    "[ACTION] deterministic explicit-request broker: "
+                    f"{requested_action}"
+                )
+                action_result = perform_robot_action(requested_action)
+                messages.append({
+                    "role": "system",
+                    "content": (
+                        "The person's explicit stationary action request was "
+                        "already passed through the safety broker. Ground your "
+                        "reply in this verified result and do not call the same "
+                        "action again:\n"
+                        f"{action_result}"
+                    ),
+                })
 
         if self.web_search_enabled and os.environ.get("OLLAMA_API_KEY"):
             tools.extend([fluffy_web_search, fluffy_web_fetch])
@@ -1248,7 +1332,7 @@ class VLMObserver:
             messages.append(response.message)
             tool_calls = response.message.tool_calls or []
             if not tool_calls:
-                return str(response.message.content or "").strip()
+                return sanitise_spoken_text(response.message.content or "")
 
             print(
                 f"[OLLAMA] executing {len(tool_calls)} bounded tool "
@@ -1378,7 +1462,9 @@ class VLMObserver:
                 "in your spoken response: either call the tool or omit the action. "
                 "If the tool rejects an action, state that it could not be done "
                 "without claiming success. Reply in plain spoken "
-                "English with no markdown. Normally answer in one short sentence "
+                "English without emoji, pictograms, stage directions, asterisks "
+                "or sound-effect notation, and use no markdown. Normally answer "
+                "in one short sentence "
                 "of no more than 35 words; use two only when genuinely needed. "
                 "Use web tools when the question depends on current, changing "
                 "or uncertain external facts. Use observe_scene when the "
@@ -1458,6 +1544,7 @@ class VLMObserver:
                 )[0].strip()
             if not result:
                 result = "I am not sure how to answer that yet."
+            result = sanitise_spoken_text(result)
 
             seconds = time.perf_counter() - started
             with self.lock:
