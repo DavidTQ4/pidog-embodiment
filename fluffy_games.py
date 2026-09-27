@@ -118,6 +118,7 @@ class FluffyGameCoordinator:
         self.queued_at = self.last_player_seen = 0.0
         self.last_error = self.recent_result = None
         self._next_poll, self._pending_reply, self._polling = 0.0, None, False
+        self._next_idle_check = 0.0
         self._lock = threading.Lock()
 
     @classmethod
@@ -146,8 +147,10 @@ class FluffyGameCoordinator:
         if self.phase == "queued":
             if now - self.queued_at > self.queue_seconds:
                 self._abort("I could not become ready in time, so the game was cancelled.")
-            elif self.is_idle():
+            elif now >= self._next_idle_check and self.is_idle():
                 self._start_game()
+            else:
+                self._next_idle_check = now + 0.5
         if self.active and self.last_player_seen and now - self.last_player_seen > self.disconnect_seconds:
             self._abort("The game disconnected. Open the page again when you want a new game.")
         if now >= self._next_poll and not self._polling:
