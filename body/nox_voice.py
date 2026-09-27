@@ -36,6 +36,7 @@ PHRASE_TO_COMMAND = {
     "arm head": "arm_head",
     "track me": "arm_head",
     "follow me": "follow_me",
+    "chase target": "chase_target",
     "what do you see": "describe_scene",
     "what can you see": "describe_scene",
     "tell me what you see": "describe_scene",

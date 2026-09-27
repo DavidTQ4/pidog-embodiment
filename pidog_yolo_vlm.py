@@ -78,6 +78,7 @@ from fluffy_action_broker import ACTION_SPECS, FluffyActionBroker
 from fluffy_games import FluffyGameCoordinator
 from fluffy_openai import chat as openai_chat, require_api_key, runtime_identity
 from fluffy_camera import capture_camera_still
+from fluffy_chase import TargetChase, red_target
 from pidog_face_identity import (
     DEFAULT_IDENTITY_MARGIN,
     FaceIdentityEngine,
@@ -1913,6 +1914,7 @@ VOICE_COMMANDS = {
     "arm head": "arm_head",
     "track me": "arm_head",
     "follow me": "follow_me",
+    "chase target": "chase_target",
     "what do you see": "describe_scene",
     "what can you see": "describe_scene",
     "tell me what you see": "describe_scene",
@@ -1937,7 +1939,7 @@ def voice_message_command(message: dict[str, object]) -> str | None:
         "select_me",
         "arm_head",
         "follow_me",
-        "describe_scene",
+        "chase_target",        "describe_scene",
         "conversation",
         "game_instructions",
         "chess_instructions",
@@ -2798,6 +2800,28 @@ def main() -> None:
     voice_poller: VoiceCommandPoller | None = None
     last_voice_error_log_time = 0.0
     voice_event_history: deque[dict[str, object]] = deque(maxlen=12)
+    def halt_chase():
+        try:
+            response = robot_session.post(
+                f"{args.robot_api.rstrip('/')}/command",
+                json={"cmd": "halt", "speed": 40}, timeout=(1, 3),
+            )
+            response.raise_for_status()
+            if response.json().get("ok") is not True:
+                print("[CHASE] Pi did not confirm halt")
+        except (requests.RequestException, ValueError) as exc:
+            print(f"[CHASE] halt failed: {exc}")
+
+    chase = TargetChase(
+        head=lambda y, p: command_head(robot_session, args.robot_api, y, p),
+        move=lambda action: command_body_action(
+            robot_session, args.robot_api, action, 1, 98,
+            args.follow_distance if action == "forward" else args.turn_clearance,
+        ),
+        halt=halt_chase,
+        keep_awake=lambda: keep_body_awake(robot_session, args.robot_api),
+        interval=args.turn_interval,
+    )
     game_lock = {"active": False}
 
     def set_game_lock(active: bool) -> None:
@@ -2808,6 +2832,7 @@ def main() -> None:
             not vlm.snapshot().running
             and not movement_enabled
             and not turning_enabled
+            and not chase.active
             and robot_motion_idle(robot_session, args.robot_api)
         ),
         speak=lambda text: speak_robot(args.robot_api, text),
@@ -2892,6 +2917,16 @@ def main() -> None:
             )
 
         while True:
+            # Drain safety commands before admitting a chase gait, even if video stalls.
+            if voice_poller is not None:
+                early_commands, early_error = voice_poller.drain()
+                voice_command_queue.extend(early_commands)
+                if chase.active and (early_error or any(c in {
+                    "stop", "lie_down", "stop_and_lie_down", "conversation",
+                    "arm_head", "follow_me", "select_me",
+                } or m.get("local_action") for c, m in voice_command_queue)):
+                    chase.stop("voice interruption")
+            chase.watchdog(time.monotonic())
             sequence, clean_frame, stream_error = camera.latest()
             if clean_frame is None or sequence == last_sequence:
                 time.sleep(0.003)
@@ -2902,8 +2937,15 @@ def main() -> None:
             if game_coordinator is not None:
                 game_coordinator.tick()
                 if game_lock["active"]:
+                    chase.stop("game started")
                     movement_enabled = False
                     turning_enabled = False
+            if chase.active:
+                if stream_error:
+                    chase.stop("camera error")
+                else:
+                    chase.update(clean_frame, time.monotonic())
+                    yaw, pitch = chase.yaw, chase.pitch
             head_failure = head_controller.consume_failure()
             if head_failure is not None:
                 failure_count, failure_reason = head_failure
@@ -3668,8 +3710,12 @@ def main() -> None:
                     cv2.LINE_AA,
                 )
 
+            cv2.putText(display_frame, f"CHASE: {chase.reason}", (12, 28),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 180, 255), 2)
             cv2.imshow("PiDog YOLO + Qwen VLM", display_frame)
             key = cv2.waitKey(1) & 0xFF
+            if key != 255:
+                chase.stop("keyboard interruption")
 
             # The worker performs all voice-inbox network I/O. Safety
             # commands have already been executed locally by the Pi; consuming
@@ -3772,6 +3818,7 @@ def main() -> None:
                     "lie_down",
                     "stop_and_lie_down",
                 }:
+                    chase.stop("voice stop")
                     movement_enabled = False
                     turning_enabled = False
                     body_safety_stopped = False
@@ -3785,6 +3832,36 @@ def main() -> None:
                         f"Voice {voice_command}: head/body following DISARMED; "
                         f"local posture action {local_status}"
                     )
+                elif key == 255 and voice_command == "chase_target":
+                    if game_lock["active"] or vlm.snapshot().running:
+                        speak_robot(args.robot_api, "I cannot chase while a game or conversation is active.")
+                    elif chase.active:
+                        print("[CHASE] already active")
+                    elif red_target(clean_frame) is None:
+                        speak_robot(args.robot_api, "Show me one clear red target first.")
+                    else:
+                        movement_enabled = turning_enabled = False
+                        # Finish any queued person head command before changing ownership.
+                        head_controller.stop()
+                        head_controller = LatestHeadController(args.robot_api)
+                        head_controller.start()
+                        prepared, error = prepare_body_for_following(robot_session, args.robot_api, args.stand_speed)
+                        # A spoken stop may arrive while the slow stand completes.
+                        # Do not start chasing after that interruption.
+                        if voice_poller is not None:
+                            preparation_commands, preparation_error = voice_poller.drain()
+                            voice_command_queue.extend(preparation_commands)
+                            if preparation_error or voice_command_queue:
+                                prepared = False
+                                error = "voice interruption during preparation"
+                        if prepared and command_head(robot_session, args.robot_api, 0, 0):
+                            yaw = pitch = 0.0
+                            head_reference_known = True
+                            chase.start(time.monotonic())
+                            print("[CHASE] armed for red target; say Fluffy stop to cancel")
+                        else:
+                            halt_chase()
+                            print(f"[CHASE] preparation failed: {error}")
                 elif key == 255 and voice_command == "conversation":
                     encoded_audio = voice_message.get("audio_b64")
                     try:
@@ -3808,6 +3885,7 @@ def main() -> None:
                             "selected_track_id": selected_track_id,
                             "head_tracking_armed": movement_enabled,
                             "body_following_armed": turning_enabled,
+                            "red_target_chase_active": chase.active,
                             "head_yaw_degrees": round(yaw, 1),
                             "head_pitch_degrees": round(pitch, 1),
                             "ultrasonic_distance_cm": last_body_distance,
@@ -4198,6 +4276,7 @@ def main() -> None:
                             except Exception as exc:
                                 print(f"Could not speak busy response: {exc}")
     finally:
+        chase.stop("desktop shutdown")
         if game_coordinator is not None:
             game_coordinator.close()
         if voice_poller is not None:
