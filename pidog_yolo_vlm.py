@@ -2345,10 +2345,7 @@ def main() -> None:
         args.asr_word_confidence,
     )
     robot_session = requests.Session()
-    llm_action_broker = FluffyActionBroker(
-        args.robot_api,
-        session=robot_session,
-    )
+    llm_action_broker = FluffyActionBroker(args.robot_api)
     print(
         "LLM stationary actions enabled: "
         + ", ".join(llm_action_broker.allowed_actions)
@@ -3737,6 +3734,7 @@ def main() -> None:
             voice_poller.stop()
         head_controller.stop()
         camera.stop()
+        llm_action_broker.close()
         robot_session.close()
         cv2.destroyAllWindows()
         print("PiDog YOLO + VLM person tracker stopped")
