@@ -171,6 +171,34 @@ Safety boundaries:
 Normal deterministic voice commands and the local emergency stop remain
 separate from this LLM facility.
 
+
+### Voluntary fresh vision
+
+The Ollama conversation agent also receives a read-only `observe_scene` tool.
+It can request one fresh Qwen-VL analysis of the newest raw camera frame during
+a conversational turn. The resulting description is returned to Ollama as
+tool evidence before Fluffy prepares the spoken response.
+
+The prompt encourages this when someone asks what Fluffy can currently see,
+shows it an object, asks where something is, or when a new visual check would
+materially improve an answer. It is not run for every conversation.
+
+Boundaries:
+
+- at most one voluntary scene observation per conversation turn;
+- the tool receives a raw camera frame rather than the annotated display;
+- recent YOLO detections are supplied as fallible contextual hints;
+- the observation is read-only and cannot select, track or approach anything;
+- failures and missing frames are returned explicitly, so Fluffy must not
+  pretend it saw something;
+- the successful result updates the cached visual description available to
+  later conversation turns.
+
+An explicit deterministic **“Fluffy, what do you see?”** command continues to
+use the existing direct scene-description route. More conversational questions
+such as **“Fluffy, can you see what I am holding?”** can cause Ollama to choose
+the new tool itself.
+
 ## 🚀 Quick Start
 
 ### Prerequisites
