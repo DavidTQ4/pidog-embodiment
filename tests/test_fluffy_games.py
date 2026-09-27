@@ -3,7 +3,7 @@ import sys
 import unittest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
-from fluffy_games import TicTacToe
+from fluffy_games import CHESS_DIFFICULTIES, TicTacToe
 
 
 class TicTacToeTests(unittest.TestCase):
@@ -31,6 +31,25 @@ class TicTacToeTests(unittest.TestCase):
                         branch.human_move(cell)
                         explore(branch)
         explore(TicTacToe())
+
+
+class ChessConfigurationTests(unittest.TestCase):
+    def test_phone_difficulty_names_are_stable(self):
+        self.assertEqual(
+            list(CHESS_DIFFICULTIES),
+            ["puppy", "friendly", "clever", "strong"],
+        )
+
+    def test_difficulties_increase_skill_and_thinking_time(self):
+        levels = list(CHESS_DIFFICULTIES.values())
+        self.assertEqual(
+            [level["skill"] for level in levels],
+            sorted(level["skill"] for level in levels),
+        )
+        self.assertEqual(
+            [level["move_time"] for level in levels],
+            sorted(level["move_time"] for level in levels),
+        )
 
 
 if __name__ == "__main__":
