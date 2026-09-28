@@ -1,7 +1,9 @@
 """Guided, local face enrolment for PiDog's owner-recognition profile.
 
 Only aligned face crops and SFace embeddings are stored. Full camera frames are
-not written to disk. The PiDog head follows the single visible face when armed.
+not written to disk. The default camera transport is the low-latency H.264
+stream reverse-forwarded to the desktop through the PiDog Tailscale brain link.
+The PiDog head follows the single visible face when armed.
 
 Controls:
   C       Centre head and establish its reference position
@@ -20,6 +22,10 @@ import time
 from pathlib import Path
 
 import cv2
+try:
+    import av
+except ImportError:
+    av = None
 import numpy as np
 import requests
 
@@ -32,7 +38,7 @@ from pidog_face_identity import (
 )
 
 
-DEFAULT_STREAM = "http://127.0.0.1:19000/mjpg"
+DEFAULT_STREAM = "tcp://127.0.0.1:19001"
 DEFAULT_ROBOT_API = "http://127.0.0.1:18888"
 DEFAULT_PROFILE = "face_profiles/David.npz"
 DEFAULT_IMAGES = "face_profiles/David_images"
@@ -54,15 +60,9 @@ MAX_DUPLICATE_SIMILARITY = 0.9985
 
 POSE_GUIDANCE = (
     "Look straight at PiDog",
-    "Slowly turn your face left",
-    "Slowly turn your face right",
-    "Tilt your face slightly upward",
-    "Tilt your face slightly downward",
-    "Vary expression and distance slightly",
-)
+    "Slowly turclass LatestFrameCamera:
+    """Retain only the latest decoded frame from H.264 or an explicit fallback."""
 
-
-class LatestFrameCamera:
     def __init__(self, url: str):
         self.url = url
         self.frame: np.ndarray | None = None
@@ -84,6 +84,51 @@ class LatestFrameCamera:
             frame = None if self.frame is None else self.frame.copy()
             return self.sequence, frame, self.error
 
+    def _publish(self, frame: np.ndarray) -> None:
+        with self.lock:
+            self.frame = frame
+            self.sequence += 1
+            self.error = None
+
+    def _run_h264(self) -> None:
+        """Decode the reverse-forwarded raw H.264 stream with low buffering."""
+        if av is None:
+            with self.lock:
+                self.error = (
+                    "H.264 mode requires PyAV; install it with: "
+                    "python -m pip install av"
+                )
+            return
+
+        while not self.stop_event.is_set():
+            container = None
+            try:
+                container = av.open(
+                    self.url,
+                    format="h264",
+                    mode="r",
+                    options={
+                        "fflags": "nobuffer",
+                        "flags": "low_delay",
+                        "probesize": "32",
+                        "analyzeduration": "0",
+                    },
+                    timeout=(5.0, 5.0),
+                )
+                with self.lock:
+                    self.error = None
+                for decoded in container.decode(video=0):
+                    if self.stop_event.is_set():
+                        break
+                    self._publish(decoded.to_ndarray(format="bgr24"))
+            except Exception as exc:
+                with self.lock:
+                    self.error = f"H.264 stream interrupted: {exc}"
+                self.stop_event.wait(0.5)
+            finally:
+                if container is not None:
+                    container.close()
+
     def _open(self) -> cv2.VideoCapture:
         capture = cv2.VideoCapture(self.url, cv2.CAP_FFMPEG)
         if not capture.isOpened():
@@ -92,13 +137,14 @@ class LatestFrameCamera:
         capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         return capture
 
-    def _run(self) -> None:
+    def _run_opencv(self) -> None:
+        """Keep --stream usable for an explicit HTTP MJPEG fallback."""
         while not self.stop_event.is_set():
             capture = self._open()
             if not capture.isOpened():
                 with self.lock:
                     self.error = f"Could not open stream: {self.url}"
-                time.sleep(1)
+                self.stop_event.wait(1)
                 continue
             with self.lock:
                 self.error = None
@@ -108,9 +154,17 @@ class LatestFrameCamera:
                     with self.lock:
                         self.error = "Stream stopped; reconnecting"
                     break
-                with self.lock:
-                    self.frame = frame
-                    self.sequence += 1
+                self._publish(frame)
+            capture.release()
+            if not self.stop_event.is_set():
+                self.stop_event.wait(0.5)
+
+    def _run(self) -> None:
+        if self.url.lower().startswith("tcp://"):
+            self._run_h264()
+        else:
+            self._run_opencv()
+                self.sequence += 1
                     self.error = None
             capture.release()
             if not self.stop_event.is_set():
@@ -277,7 +331,7 @@ def main() -> None:
                 print(stream_error)
             time.sleep(0.5)
         else:
-            raise RuntimeError("No MJPEG frames received after 15 seconds")
+            raise RuntimeError("No camera frames received after 15 seconds")
 
         while True:
             sequence, frame, stream_error = camera.latest()
