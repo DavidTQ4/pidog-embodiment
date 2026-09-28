@@ -3003,13 +3003,13 @@ def main() -> None:
             )
         print(f"Camera stream ready after {warmup_frames} fresh frames")
 
-        if command_head(robot_session, args.robot_api, 0.0, 0.0):
+        if reset_robot_to_startup_pose(robot_session, args.robot_api):
             yaw = 0.0
             pitch = 0.0
             head_reference_known = True
             print(
-                "Head centred automatically; tracking and body following "
-                "remain disarmed"
+                "PiDog startup pose restored automatically; tracking and "
+                "body following remain disarmed"
             )
         else:
             print(
