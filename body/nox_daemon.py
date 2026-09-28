@@ -793,14 +793,28 @@ def _supported_actions():
     return sorted(set(dict_actions + preset_fns))
 
 
-def cmd_head(yaw=0, roll=0, pitch=0, smooth=True, internal=False):
-    """Move head with smooth easing + deadband filter."""
+def cmd_head(
+    yaw=0,
+    roll=0,
+    pitch=0,
+    smooth=True,
+    internal=False,
+    force=False,
+):
+    """Move head with smooth easing + deadband filter.
+
+    Force is for re-centring after a preset posture has moved the physical
+    head outside this controller; it bypasses the stale-target deadband once.
+    """
     _mark_activity(internal=internal)
     if _servo_pwm_disabled:
         return {"ok": False, "error": "servos sleeping", "hint": "send wake first"}
     yaw, roll, pitch = float(yaw), float(roll), float(pitch)
-    # Deadband: skip if change is too small
-    if not _smooth_head.update_target(yaw, roll, pitch):
+    # Preset actions can move the physical head without updating this
+    # controller's target. A forced centre must therefore not be skipped just
+    # because the previous requested target happened to be the same.
+    target_changed = _smooth_head.update_target(yaw, roll, pitch)
+    if not force and not target_changed:
         return {"ok": True, "head": [yaw, roll, pitch], "skipped": "deadband"}
     if not smooth:
         # Direct move (for resets/wake)
@@ -1586,7 +1600,14 @@ COMMANDS = {
     "move": lambda args: cmd_move(args.get("action", "stand"), args.get("steps", 3), args.get("speed", 80), internal=args.get("_internal", False)),
     "move_if_idle": lambda args: cmd_move_if_idle(args.get("action", "stand"), args.get("steps", 3), args.get("speed", 80), internal=args.get("_internal", False), min_distance_cm=args.get("min_distance_cm")),
     "motion_status": lambda args: cmd_motion_status(),
-    "head": lambda args: cmd_head(args.get("yaw", 0), args.get("roll", 0), args.get("pitch", 0), args.get("smooth", True), internal=args.get("_internal", False)),
+    "head": lambda args: cmd_head(
+        args.get("yaw", 0),
+        args.get("roll", 0),
+        args.get("pitch", 0),
+        args.get("smooth", True),
+        internal=args.get("_internal", False),
+        force=bool(args.get("force", False)),
+    ),
     "head_ema": lambda args: cmd_head_ema(args.get("yaw", 0), args.get("roll", 0), args.get("pitch", 0), internal=args.get("_internal", False)),
     "groove_pose": lambda args: cmd_groove_pose(args.get("yaw", 0), args.get("roll", 0), args.get("pitch", 0), args.get("tail", 0)),
     "groove_stop": lambda args: cmd_groove_stop(),
