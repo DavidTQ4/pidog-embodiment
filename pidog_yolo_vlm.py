@@ -764,6 +764,8 @@ class VLMObserver:
         self.lock = threading.Lock()
         self.conversation_history: deque[dict[str, str]] = deque(maxlen=12)
         self.transcriber = None
+        self.transcriber_lock = threading.Lock()
+        self.pending_conversation = None
         self.last_scene_text = ""
         self.last_scene_time = 0.0
 
@@ -990,6 +992,30 @@ class VLMObserver:
         }
 
 
+    def warm_transcriber(self) -> None:
+        """Load Faster-Whisper off the interactive path during startup."""
+        if not self.asr_model or WhisperModel is None:
+            return
+
+        def worker() -> None:
+            try:
+                self._get_transcriber()
+            except Exception as exc:
+                print(
+                    "Faster-Whisper warm-up failed; it will retry on demand: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+
+        print("Warming Faster-Whisper ASR in the background...")
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _start_conversation(self, request: tuple) -> None:
+        threading.Thread(
+            target=self._converse,
+            args=request,
+            daemon=True,
+        ).start()
+
     def submit_conversation(
         self,
         audio: bytes,
@@ -1001,33 +1027,33 @@ class VLMObserver:
         scene_observer=None,
         camera_still_provider=None,
         system_status_provider=None,
-    ) -> bool:
-        """Transcribe and answer one conversational voice turn asynchronously."""
+    ) -> str:
+        """Start a voice turn, or retain the newest turn while one is active."""
+        request = (
+            bytes(audio),
+            int(sample_rate),
+            fallback_text,
+            dict(robot_context),
+            on_complete,
+            action_executor,
+            scene_observer,
+            camera_still_provider,
+            system_status_provider,
+        )
         with self.lock:
             if self.state.running:
-                return False
+                # Voice input is ephemeral. Retain one current question rather
+                # than replying to an obsolete queue of earlier utterances.
+                self.pending_conversation = request
+                return "queued"
             self.state.running = True
             self.state.error = None
             self.state.text = "Listening and preparing a response..."
             self.state.seconds = None
             self.state.detections_used = 0
 
-        threading.Thread(
-            target=self._converse,
-            args=(
-                bytes(audio),
-                int(sample_rate),
-                fallback_text,
-                dict(robot_context),
-                on_complete,
-                action_executor,
-                scene_observer,
-                camera_still_provider,
-                system_status_provider,
-            ),
-            daemon=True,
-        ).start()
-        return True
+        self._start_conversation(request)
+        return "started"
 
     def submit_game_comment(self, game_context: dict, on_complete) -> bool:
         """Generate a short spoken comment about a current or finished game."""
@@ -1080,16 +1106,18 @@ class VLMObserver:
                 "python -m pip install --upgrade faster-whisper"
             )
         if self.transcriber is None:
-            print(
-                f"Loading Faster-Whisper ASR: {self.asr_model} "
-                "(CUDA int8_float16)"
-            )
-            self.transcriber = WhisperModel(
-                self.asr_model,
-                device="cuda",
-                compute_type="int8_float16",
-            )
-            print("Faster-Whisper ready")
+            with self.transcriber_lock:
+                if self.transcriber is None:
+                    print(
+                        f"Loading Faster-Whisper ASR: {self.asr_model} "
+                        "(CUDA int8_float16)"
+                    )
+                    self.transcriber = WhisperModel(
+                        self.asr_model,
+                        device="cuda",
+                        compute_type="int8_float16",
+                    )
+                    print("Faster-Whisper ready")
         return self.transcriber
 
     @staticmethod
@@ -1687,7 +1715,9 @@ class VLMObserver:
                 })
                 self.state.text = result
                 self.state.seconds = seconds
-                self.state.running = False
+                next_request = self.pending_conversation
+                self.pending_conversation = None
+                self.state.running = next_request is not None
             print(
                 f"\nCONVERSATION ({seconds:.2f}s)\n"
                 f"ASR: {asr_source}\n"
@@ -1702,6 +1732,9 @@ class VLMObserver:
                         "Conversation speech callback failed: "
                         f"{type(callback_error).__name__}: {callback_error}"
                     )
+            if next_request is not None:
+                print("Starting most recent queued conversation request")
+                self._start_conversation(next_request)
         except Exception as exc:
             seconds = time.perf_counter() - started
             message = f"{type(exc).__name__}: {exc}"
@@ -1709,8 +1742,13 @@ class VLMObserver:
                 self.state.text = "Conversation failed; see terminal"
                 self.state.seconds = seconds
                 self.state.error = message
-                self.state.running = False
+                next_request = self.pending_conversation
+                self.pending_conversation = None
+                self.state.running = next_request is not None
             print(f"\nConversation error: {message}\n")
+            if next_request is not None:
+                print("Starting most recent queued conversation request")
+                self._start_conversation(next_request)
 
 
 def synthesize_windows_speech(text: str) -> bytes:
@@ -2748,6 +2786,7 @@ def main() -> None:
         args.conversation_backend,
         args.openai_model,
     )
+    vlm.warm_transcriber()
     robot_session = requests.Session()
     llm_action_broker = FluffyActionBroker(args.robot_api)
     print(
@@ -3929,19 +3968,15 @@ def main() -> None:
                                 )
                             ),
                         )
-                        if accepted:
+                        if accepted == "started":
                             print(
                                 "Conversational turn accepted; desktop "
                                 "Whisper and Fluffy LLM response started"
                             )
-                        else:
+                        elif accepted == "queued":
                             print(
-                                "Conversation ignored because Qwen is "
-                                "already processing another request"
-                            )
-                            speak_robot(
-                                args.robot_api,
-                                "I am still thinking about the previous request.",
+                                "Conversation queued; the most recent question "
+                                "will run after the current response"
                             )
                     except Exception as exc:
                         print(f"Conversation request rejected: {exc}")
