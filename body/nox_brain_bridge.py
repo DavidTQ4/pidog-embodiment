@@ -934,6 +934,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 "roll": body.get("roll", 0),
                 "pitch": body.get("pitch", 0),
                 "force": bool(body.get("force", False)),
+                "clear_queue": bool(body.get("clear_queue", False)),
             })
             if isinstance(r, dict):
                 r["tracking"] = tracking
