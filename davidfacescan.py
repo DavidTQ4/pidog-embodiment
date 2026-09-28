@@ -60,7 +60,15 @@ MAX_DUPLICATE_SIMILARITY = 0.9985
 
 POSE_GUIDANCE = (
     "Look straight at PiDog",
-    "Slowly turclass LatestFrameCamera:
+    "Slowly turn your face left",
+    "Slowly turn your face right",
+    "Tilt your face slightly upward",
+    "Tilt your face slightly downward",
+    "Vary expression and distance slightly",
+)
+
+
+class LatestFrameCamera:
     """Retain only the latest decoded frame from H.264 or an explicit fallback."""
 
     def __init__(self, url: str):
@@ -164,11 +172,7 @@ POSE_GUIDANCE = (
             self._run_h264()
         else:
             self._run_opencv()
-                self.sequence += 1
-                    self.error = None
-            capture.release()
-            if not self.stop_event.is_set():
-                time.sleep(0.5)
+
 
 
 def command_head(
