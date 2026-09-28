@@ -2722,6 +2722,15 @@ def parse_args() -> argparse.Namespace:
         help="Fresh-frame warm-up period before automatic head centring.",
     )
     parser.add_argument(
+        "--centre-head-pitch",
+        type=float,
+        default=20.0,
+        help=(
+            "Raised head pitch used by C and 'Fluffy centre' after posture "
+            "actions; increase slightly if the camera still looks down."
+        ),
+    )
+    parser.add_argument(
         "--voice-poll-interval",
         type=float,
         default=0.25,
@@ -2773,6 +2782,8 @@ def main() -> None:
         raise ValueError(
             "--camera-warmup-seconds must be between 0.5 and 10 seconds"
         )
+    if not 0.0 <= args.centre_head_pitch <= 30.0:
+        raise ValueError("--centre-head-pitch must be between 0 and 30 degrees")
     if not 0.1 <= args.voice_poll_interval <= 5.0:
         raise ValueError("--voice-poll-interval must be between 0.1 and 5 seconds")
 
@@ -2968,11 +2979,11 @@ def main() -> None:
             robot_session,
             args.robot_api,
             0.0,
-            0.0,
+            args.centre_head_pitch,
             force=True,
         ):
             yaw = 0.0
-            pitch = 0.0
+            pitch = args.centre_head_pitch
             head_reference_known = True
             print(
                 "Head centred automatically; tracking and body following "
@@ -4185,13 +4196,16 @@ def main() -> None:
                     robot_session,
                     args.robot_api,
                     0.0,
-                    0.0,
+                    args.centre_head_pitch,
                     force=True,
                 ):
                     yaw = 0.0
-                    pitch = 0.0
+                    pitch = args.centre_head_pitch
                     head_reference_known = True
-                    print("Head centred; movement remains disarmed")
+                    print(
+                        "Head centred for the current posture; "
+                        f"pitch={pitch:.1f} degrees; movement remains disarmed"
+                    )
             if game_lock["active"] and key in (ord("m"), ord("t")):
                 print("Head tracking and body following are locked during the game")
                 key = 255
