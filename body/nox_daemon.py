@@ -1259,13 +1259,28 @@ def cmd_sleep():
 
 
 def cmd_reset():
-    """Reset to neutral standing."""
+    """Restore the same neutral standing pose used during daemon startup.
+
+    Preset actions queue independent leg/head/tail frames. Clear all three
+    queues first so a lingering howl or lie pose cannot overwrite stand.
+    This deliberately uses the SDK stand action alone: that is the exact pose
+    command issued by init_dog() after PiDog construction.
+    """
     with dog_lock:
-        dog.do_action('stand', speed=60)
+        cleared_frames = _clear_action_buffers((
+            "legs_action_buffer",
+            "head_action_buffer",
+            "tail_action_buffer",
+        ))
+        dog.do_action("stand", speed=60)
         time.sleep(1)
-        dog.head_move([[0, 0, 0]], immediately=True, speed=60)
-        dog.rgb_strip.set_mode('monochromatic', [0, 0, 0])
-    return {"ok": True}
+        dog.rgb_strip.set_mode("monochromatic", [0, 0, 0])
+    _smooth_head.snap_to(0, 0, 0)
+    return {
+        "ok": True,
+        "pose": "startup_stand",
+        "cleared_motion_frames": cleared_frames,
+    }
 
 
 # ─── Sensor Commands ───
