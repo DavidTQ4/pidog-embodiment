@@ -766,6 +766,7 @@ class VLMObserver:
         self.transcriber = None
         self.transcriber_lock = threading.Lock()
         self.pending_conversation = None
+        self.conversation_active = False
         self.last_scene_text = ""
         self.last_scene_time = 0.0
 
@@ -1041,11 +1042,15 @@ class VLMObserver:
             system_status_provider,
         )
         with self.lock:
-            if self.state.running:
+            if self.conversation_active:
                 # Voice input is ephemeral. Retain one current question rather
                 # than replying to an obsolete queue of earlier utterances.
                 self.pending_conversation = request
                 return "queued"
+            if self.state.running:
+                # A separate visual or game task owns the shared model state.
+                return "busy"
+            self.conversation_active = True
             self.state.running = True
             self.state.error = None
             self.state.text = "Listening and preparing a response..."
@@ -1717,6 +1722,7 @@ class VLMObserver:
                 self.state.seconds = seconds
                 next_request = self.pending_conversation
                 self.pending_conversation = None
+                self.conversation_active = next_request is not None
                 self.state.running = next_request is not None
             print(
                 f"\nCONVERSATION ({seconds:.2f}s)\n"
@@ -1744,6 +1750,7 @@ class VLMObserver:
                 self.state.error = message
                 next_request = self.pending_conversation
                 self.pending_conversation = None
+                self.conversation_active = next_request is not None
                 self.state.running = next_request is not None
             print(f"\nConversation error: {message}\n")
             if next_request is not None:
@@ -3977,6 +3984,11 @@ def main() -> None:
                             print(
                                 "Conversation queued; the most recent question "
                                 "will run after the current response"
+                            )
+                        else:
+                            print(
+                                "Conversation unavailable while another model "
+                                "task is completing"
                             )
                     except Exception as exc:
                         print(f"Conversation request rejected: {exc}")
