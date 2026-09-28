@@ -2724,10 +2724,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--centre-head-pitch",
         type=float,
-        default=20.0,
+        default=-30.0,
         help=(
-            "Raised head pitch used by C and 'Fluffy centre' after posture "
-            "actions; increase slightly if the camera still looks down."
+            "Resting head pitch used by C and 'Fluffy centre' after posture "
+            "actions. The default matches PiDog's lying/wake position."
         ),
     )
     parser.add_argument(
@@ -2782,8 +2782,8 @@ def main() -> None:
         raise ValueError(
             "--camera-warmup-seconds must be between 0.5 and 10 seconds"
         )
-    if not 0.0 <= args.centre_head_pitch <= 30.0:
-        raise ValueError("--centre-head-pitch must be between 0 and 30 degrees")
+    if not -30.0 <= args.centre_head_pitch <= 30.0:
+        raise ValueError("--centre-head-pitch must be between -30 and 30 degrees")
     if not 0.1 <= args.voice_poll_interval <= 5.0:
         raise ValueError("--voice-poll-interval must be between 0.1 and 5 seconds")
 
