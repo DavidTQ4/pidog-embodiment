@@ -800,11 +800,14 @@ def cmd_head(
     smooth=True,
     internal=False,
     force=False,
+    clear_queue=False,
 ):
     """Move head with smooth easing + deadband filter.
 
-    Force is for re-centring after a preset posture has moved the physical
-    head outside this controller; it bypasses the stale-target deadband once.
+    ``clear_queue`` is an explicit posture-reset operation: it discards any
+    remaining head frames from a just-finished preset action before applying
+    the requested pose. Without it, a queued lie/howl frame can overwrite a
+    centre command after the command has already returned.
     """
     _mark_activity(internal=internal)
     if _servo_pwm_disabled:
@@ -813,6 +816,12 @@ def cmd_head(
     # Preset actions can move the physical head without updating this
     # controller's target. A forced centre must therefore not be skipped just
     # because the previous requested target happened to be the same.
+    # Clearing the SDK head queue makes the reset win over any remaining
+    # action frame (for example, lie_down's look-at-floor pose).
+    cleared_frames = 0
+    if clear_queue:
+        with dog_lock:
+            cleared_frames = _clear_action_buffers(("head_action_buffer",))
     target_changed = _smooth_head.update_target(yaw, roll, pitch)
     if not force and not target_changed:
         return {"ok": True, "head": [yaw, roll, pitch], "skipped": "deadband"}
@@ -826,7 +835,7 @@ def cmd_head(
             )
             time.sleep(0.3)
         _smooth_head.snap_to(yaw, roll, pitch)
-        return {"ok": True, "head": [yaw, roll, pitch]}
+        return {"ok": True, "head": [yaw, roll, pitch], "cleared_head_frames": cleared_frames}
     # Smooth eased interpolation (S-curve)
     start = _smooth_head.get_current()
     target = [yaw, roll, pitch]
@@ -844,7 +853,7 @@ def cmd_head(
             )
             time.sleep(step_delay)
     _smooth_head.snap_to(yaw, roll, pitch)
-    return {"ok": True, "head": [yaw, roll, pitch]}
+    return {"ok": True, "head": [yaw, roll, pitch], "cleared_head_frames": cleared_frames}
 
 
 
@@ -1607,6 +1616,7 @@ COMMANDS = {
         args.get("smooth", True),
         internal=args.get("_internal", False),
         force=bool(args.get("force", False)),
+        clear_queue=bool(args.get("clear_queue", False)),
     ),
     "head_ema": lambda args: cmd_head_ema(args.get("yaw", 0), args.get("roll", 0), args.get("pitch", 0), internal=args.get("_internal", False)),
     "groove_pose": lambda args: cmd_groove_pose(args.get("yaw", 0), args.get("roll", 0), args.get("pitch", 0), args.get("tail", 0)),
