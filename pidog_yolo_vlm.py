@@ -1627,7 +1627,7 @@ class VLMObserver:
                 "state. Any camera image or fresh scene observation is from the "
                 "camera in your movable head: visual left/right always means "
                 "image-left/image-right from your current head view, never the "
-                "person's left/right or a fixed body/world direction. 
+                "person's left/right or a fixed body/world direction. "
                 "A visible identity is not proof of who is speaking. Never claim "
                 "that a requested action happened unless its confirmed state or "
                 "tool result says so. You may use perform_robot_action for a "
