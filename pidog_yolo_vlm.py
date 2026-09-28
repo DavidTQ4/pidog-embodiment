@@ -4053,6 +4053,12 @@ def main() -> None:
                         print("Voice arm head: head tracking is already armed")
                     else:
                         key = ord("m")
+                elif key == 255 and voice_command == "centre_head":
+                    print(
+                        "Voice centre: re-zeroing head yaw and pitch; "
+                        "head and body following disarmed"
+                    )
+                    key = ord("c")
                 elif key == 255 and voice_command == "follow_me":
                     if turning_enabled:
                         print("Voice follow me: body following is already armed")
