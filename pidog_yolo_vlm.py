@@ -1906,6 +1906,32 @@ def command_head(
         print(f"Head command failed: {exc}")
         return False
 
+def reset_robot_to_startup_pose(
+    session: requests.Session,
+    robot_api: str,
+) -> bool:
+    """Replay the daemon's PiDog startup stand pose.
+
+    This is intentionally a full-pose reset, not a head-angle estimate: it
+    clears stale posture animation then uses the same SDK stand action that
+    establishes the known-good pose when the body daemon starts.
+    """
+    try:
+        response = session.post(
+            f"{robot_api.rstrip('/')}/command",
+            json={"cmd": "reset"},
+            timeout=5,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        if payload.get("error") or payload.get("ok") is False:
+            print(f"Startup-pose reset rejected: {payload}")
+            return False
+        return True
+    except (requests.RequestException, ValueError) as exc:
+        print(f"Startup-pose reset failed: {exc}")
+        return False
+
 
 class LatestHeadController:
     """Deliver only the newest autonomous head target on a worker thread."""
@@ -4188,20 +4214,15 @@ def main() -> None:
             if key == ord("c"):
                 movement_enabled = False
                 turning_enabled = False
-                if command_head(
+                if reset_robot_to_startup_pose(
                     robot_session,
                     args.robot_api,
-                    0.0,
-                    0.0,
-                    force=True,
-                    clear_queue=True,
                 ):
                     yaw = 0.0
                     pitch = 0.0
                     head_reference_known = True
                     print(
-                        "Head-centre queue cleared and neutral pose applied; "
-                        "movement remains disarmed"
+                        "PiDog startup pose restored; movement remains disarmed"
                     )
             if game_lock["active"] and key in (ord("m"), ord("t")):
                 print("Head tracking and body following are locked during the game")
