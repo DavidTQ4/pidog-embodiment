@@ -1273,6 +1273,10 @@ def cmd_reset():
             "tail_action_buffer",
         ))
         dog.do_action("stand", speed=60)
+        # PiDog's stand action controls only the legs. Howling leaves a
+        # separate head frame at -40, so explicitly send logical neutral
+        # head coordinates. The SDK applies its calibrated pitch offset.
+        dog.head_move([[0, 0, 0]], immediately=True, speed=60)
         time.sleep(1)
         dog.rgb_strip.set_mode("monochromatic", [0, 0, 0])
     _smooth_head.snap_to(0, 0, 0)
