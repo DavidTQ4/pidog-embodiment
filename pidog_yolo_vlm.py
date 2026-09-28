@@ -155,16 +155,16 @@ REACQUIRE_MIN_AREA_RATIO = 0.35
 REACQUIRE_MAX_AREA_RATIO = 2.85
 X_DEADBAND = 0.10
 Y_DEADBAND = 0.10
-YAW_GAIN = 15.0
-PITCH_GAIN = 8.0
-MAX_YAW_STEP_DEGREES = 7.0
-MAX_PITCH_STEP_DEGREES = 3.0
+# Match TargetChase: bounded visual-servo movement, not large jumps
+# based on a potentially stale recognition frame.
+HEAD_TRACK_RATE_DEGREES_PER_SECOND = 25.0
 # SunFounder's face-tracking example uses these working limits.
 YAW_LIMITS = (-80.0, 80.0)
 PITCH_LIMITS = (-30.0, 30.0)
 COMMAND_INTERVAL = 0.10
-DEFAULT_TURN_YAW_THRESHOLD = 18.0
-DEFAULT_BODY_TURN_SCREEN_THRESHOLD = 0.18
+# Match TargetChase: let head tracking accumulate a meaningful offset before
+# a complete body-turn gait is admitted.
+DEFAULT_TURN_YAW_THRESHOLD = 30.0
 DEFAULT_TURN_COMMAND_INTERVAL = 0.75
 DEFAULT_FOLLOW_DISTANCE_CM = 55.0
 DEFAULT_TURN_CLEARANCE_CM = 20.0
@@ -2646,15 +2646,6 @@ def parse_args() -> argparse.Namespace:
         help="Head yaw in degrees that triggers one identity-locked body turn.",
     )
     parser.add_argument(
-        "--body-turn-screen-threshold",
-        type=float,
-        default=DEFAULT_BODY_TURN_SCREEN_THRESHOLD,
-        help=(
-            "Normalised horizontal image error that triggers a body turn; "
-            "forward motion pauses before this threshold is reached."
-        ),
-    )
-    parser.add_argument(
         "--turn-interval",
         type=float,
         default=DEFAULT_TURN_COMMAND_INTERVAL,
@@ -2669,10 +2660,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--turn-countersteer-degrees",
         type=float,
-        default=12.0,
+        default=0.0,
         help=(
-            "Immediate opposite head-yaw correction when a body turn is "
-            "accepted; visual tracking continues to refine it."
+            "Optional opposite head-yaw correction after a body turn. "
+            "Default 0 keeps the camera visually locked during the gait."
         ),
     )
     parser.add_argument(
@@ -2751,10 +2742,6 @@ def main() -> None:
         raise ValueError("--asr-word-confidence must be between 0 and 1")
     if not 10.0 <= args.turn_yaw_threshold <= 70.0:
         raise ValueError("--turn-yaw-threshold must be between 10 and 70")
-    if not 0.12 <= args.body_turn_screen_threshold <= 0.60:
-        raise ValueError(
-            "--body-turn-screen-threshold must be between 0.12 and 0.60"
-        )
     if args.turn_interval < 0.25:
         raise ValueError("--turn-interval must be at least 0.25 seconds")
     if not 1 <= args.turn_steps <= 3:
@@ -3252,24 +3239,23 @@ def main() -> None:
                         aim_y - frame_height / 2
                     ) / max(frame_height / 2, 1)
 
-                    yaw_step = 0.0
-                    pitch_step = 0.0
-                    if abs(error_x) >= X_DEADBAND:
-                        yaw_step = float(
-                            np.clip(
-                                -error_x * YAW_GAIN,
-                                -MAX_YAW_STEP_DEGREES,
-                                MAX_YAW_STEP_DEGREES,
-                            )
-                        )
-                    if abs(error_y) >= Y_DEADBAND:
-                        pitch_step = float(
-                            np.clip(
-                                -error_y * PITCH_GAIN,
-                                -MAX_PITCH_STEP_DEGREES,
-                                MAX_PITCH_STEP_DEGREES,
-                            )
-                        )
+                    # Use the same rate-scaled visual servo as TargetChase.
+                    # This avoids large corrections from sparse face updates.
+                    servo_dt = min(
+                        max(tracking_now - last_command_time, 0.0),
+                        COMMAND_INTERVAL,
+                    )
+                    servo_step = HEAD_TRACK_RATE_DEGREES_PER_SECOND * servo_dt
+                    yaw_step = (
+                        -servo_step if error_x >= X_DEADBAND
+                        else servo_step if error_x <= -X_DEADBAND
+                        else 0.0
+                    )
+                    pitch_step = (
+                        -servo_step if error_y >= Y_DEADBAND
+                        else servo_step if error_y <= -Y_DEADBAND
+                        else 0.0
+                    )
 
                     if yaw_step != 0.0 or pitch_step != 0.0:
                         new_yaw = float(
@@ -3314,21 +3300,12 @@ def main() -> None:
                     body_steps: int
                     body_speed: int
                     min_distance_cm: float
-                    if body_error_x >= args.body_turn_screen_threshold:
-                        body_action = "turn_right"
-                        decision_reason = "target is right of image centre"
-                        body_steps = args.turn_steps
-                        body_speed = args.turn_speed
-                        min_distance_cm = args.turn_clearance
-                    elif yaw <= -args.turn_yaw_threshold:
+                    # Follow TargetChase's discipline: the head first acquires
+                    # the target, then body motion realigns to the accumulated
+                    # head yaw. A raw screen offset alone must not initiate a gait.
+                    if yaw <= -args.turn_yaw_threshold:
                         body_action = "turn_right"
                         decision_reason = "head yaw requires body realignment"
-                        body_steps = args.turn_steps
-                        body_speed = args.turn_speed
-                        min_distance_cm = args.turn_clearance
-                    elif body_error_x <= -args.body_turn_screen_threshold:
-                        body_action = "turn_left"
-                        decision_reason = "target is left of image centre"
                         body_steps = args.turn_steps
                         body_speed = args.turn_speed
                         min_distance_cm = args.turn_clearance
@@ -3361,7 +3338,10 @@ def main() -> None:
                         if distance_cm is not None:
                             last_body_distance = distance_cm
                         if action_result == "accepted":
-                            if body_action in {"turn_left", "turn_right"}:
+                            if (
+                                body_action in {"turn_left", "turn_right"}
+                                and args.turn_countersteer_degrees > 0
+                            ):
                                 countersteer_sign = (
                                     1.0 if body_action == "turn_right" else -1.0
                                 )
