@@ -1878,13 +1878,20 @@ def command_head(
     robot_api: str,
     yaw: float,
     pitch: float,
+    *,
+    force: bool = False,
 ) -> bool:
     """Send one smooth manual head-position command through the Pi bridge."""
 
     try:
         response = session.post(
             f"{robot_api.rstrip('/')}/head",
-            json={"yaw": yaw, "roll": 0, "pitch": pitch},
+            json={
+                "yaw": yaw,
+                "roll": 0,
+                "pitch": pitch,
+                "force": force,
+            },
             timeout=3,
         )
         response.raise_for_status()
@@ -2957,7 +2964,13 @@ def main() -> None:
             )
         print(f"Camera stream ready after {warmup_frames} fresh frames")
 
-        if command_head(robot_session, args.robot_api, 0.0, 0.0):
+        if command_head(
+            robot_session,
+            args.robot_api,
+            0.0,
+            0.0,
+            force=True,
+        ):
             yaw = 0.0
             pitch = 0.0
             head_reference_known = True
@@ -4173,6 +4186,7 @@ def main() -> None:
                     args.robot_api,
                     0.0,
                     0.0,
+                    force=True,
                 ):
                     yaw = 0.0
                     pitch = 0.0
