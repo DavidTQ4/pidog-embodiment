@@ -2918,8 +2918,8 @@ def main() -> None:
         voice_poller.start()
         print(
             "Voice commands enabled asynchronously: select me | arm head | "
-            "follow me | what do you see | play tic-tac-toe | play chess | "
-            "conversation | stop | lie down"
+            "centre | follow me | what do you see | play tic-tac-toe | "
+            "play chess | conversation | stop | lie down"
         )
     try:
         deadline = time.monotonic() + 15
