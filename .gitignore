@@ -4,6 +4,7 @@ models/*.pb
 
 # Face database (personal data)
 face_db/
+face_profiles
 
 # Python
 __pycache__/
@@ -15,6 +16,7 @@ __pycache__/
 .ruff_cache/
 
 # Environment
+.venv
 venv
 .env
 .env.local
