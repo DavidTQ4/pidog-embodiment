@@ -933,6 +933,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 "yaw": body.get("yaw", 0),
                 "roll": body.get("roll", 0),
                 "pitch": body.get("pitch", 0),
+                "force": bool(body.get("force", False)),
             })
             if isinstance(r, dict):
                 r["tracking"] = tracking
