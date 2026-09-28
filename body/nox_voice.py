@@ -303,6 +303,10 @@ def run_local_action(args: argparse.Namespace, command: str) -> tuple[str | None
         daemon_command = {"cmd": "halt", "speed": 40}
     elif command in {"lie_down", "stop_and_lie_down"}:
         daemon_command = {"cmd": "lie_down", "speed": 40}
+    elif command == "centre_head":
+        # Centre must be local: it restores the same calibrated full pose
+        # that works at desktop startup, even if the desktop inbox is late.
+        daemon_command = {"cmd": "reset"}
     elif command in LOCAL_MOVE_ACTIONS:
         action, speed = LOCAL_MOVE_ACTIONS[command]
         daemon_command = {
