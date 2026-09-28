@@ -1880,6 +1880,7 @@ def command_head(
     pitch: float,
     *,
     force: bool = False,
+    clear_queue: bool = False,
 ) -> bool:
     """Send one smooth manual head-position command through the Pi bridge."""
 
@@ -1891,6 +1892,7 @@ def command_head(
                 "roll": 0,
                 "pitch": pitch,
                 "force": force,
+                "clear_queue": clear_queue,
             },
             timeout=3,
         )
@@ -2724,7 +2726,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--centre-head-pitch",
         type=float,
-        default=-30.0,
+        default=0.0,
         help=(
             "Resting head pitch used by C and 'Fluffy centre' after posture "
             "actions. The default matches PiDog's lying/wake position."
@@ -4190,15 +4192,16 @@ def main() -> None:
                     robot_session,
                     args.robot_api,
                     0.0,
-                    args.centre_head_pitch,
+                    0.0,
                     force=True,
+                    clear_queue=True,
                 ):
                     yaw = 0.0
-                    pitch = args.centre_head_pitch
+                    pitch = 0.0
                     head_reference_known = True
                     print(
-                        "Head centred for the current posture; "
-                        f"pitch={pitch:.1f} degrees; movement remains disarmed"
+                        "Head-centre queue cleared and neutral pose applied; "
+                        "movement remains disarmed"
                     )
             if game_lock["active"] and key in (ord("m"), ord("t")):
                 print("Head tracking and body following are locked during the game")
