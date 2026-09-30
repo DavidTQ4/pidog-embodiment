@@ -332,6 +332,25 @@ class FluffyGameCoordinator:
     def _handle_reply(self, reply: dict, now: float) -> None:
         remote = reply.get("session") or {}
         session_id = remote.get("id")
+        status = str(
+            remote.get("status") or reply.get("status") or ""
+        ).strip().lower()
+        cancelled = bool(
+            remote.get("cancelled")
+            or remote.get("canceled")
+            or reply.get("cancelled")
+            or reply.get("canceled")
+            or status in {"cancelled", "canceled", "aborted"}
+        )
+
+        # A phone-side cancellation can leave the old session ID visible to
+        # polling, so it must not be treated as a still-connected player.
+        # Likewise, an active local game with no session in a valid reply has
+        # been removed remotely and should release the tracking/game lock now.
+        if self.active and (cancelled or not session_id):
+            self._abort("The game was cancelled.")
+            return
+
         if session_id:
             self.last_player_seen = now
         requested_game = remote.get("requested_game")
