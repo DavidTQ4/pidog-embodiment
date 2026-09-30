@@ -1279,15 +1279,18 @@ class VLMObserver:
         if system_status_provider is not None:
             messages[0]["content"] += (
                 " For questions about your battery, CPU usage, CPU temperature, "
-                "memory, disk, uptime or robot health, call get_system_status. "
-                "These readings describe the Raspberry Pi body, not the Windows "
-                "desktop brain. State unavailable readings as unknown; battery "
+                "memory, disk, uptime, robot health, recent touch, or why you "
+                "howled/reacted, call get_system_status. These readings describe "
+                "the Raspberry Pi body, not the Windows desktop brain. A "
+                "touch_reaction field records only the latest local touch event; "
+                "treat it as authoritative and do not claim a touch when it is "
+                "absent. State unavailable readings as unknown; battery "
                 "percentage is approximate and charging is not measured."
             )
             status_cache = None
 
             def get_system_status() -> str:
-                """Read current Raspberry Pi battery voltage and estimated charge, CPU percent and temperature, RAM, disk, uptime, and available robot health diagnostics. Use when asked about system status or health."""
+                """Read current Raspberry Pi battery voltage and estimated charge, CPU percent and temperature, RAM, disk, uptime, robot health diagnostics, and the most recent local touch reaction. Use when asked about system status, health, touch, or why Fluffy reacted."""
                 nonlocal status_cache
                 if status_cache is None:
                     try:
