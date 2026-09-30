@@ -154,6 +154,18 @@ current_leg_action = None
 motion_halt_latched = False
 running = True
 
+# Touch is handled locally so Fluffy can react even while the desktop is busy
+# or disconnected.  The latest event is exposed through status for conversation.
+touch_event_lock = threading.Lock()
+last_touch_event = {
+    "detected": False,
+    "side": "none",
+    "at_unix": None,
+    "reaction": None,
+}
+TOUCH_POLL_SECONDS = 0.05
+TOUCH_REACTION_COOLDOWN_SECONDS = 4.0
+
 # ─── Servo Idle Management ───
 _last_activity = time.time()
 _idle_state = "active"  # active -> resting -> sleeping
@@ -421,6 +433,8 @@ def cmd_status():
             "busy": True,
             "error": f"{type(e).__name__}: {e}",
         }
+    with touch_event_lock:
+        info["touch_reaction"] = dict(last_touch_event)
     return info
 
 
@@ -1405,6 +1419,70 @@ def cmd_touch():
         }
 
 
+def _touch_side(touch):
+    """Convert the SDK's compact dual-touch code into a stable description."""
+    return {
+        "N": "none",
+        "L": "left",
+        "R": "right",
+        "LS": "slide-left",
+        "RS": "slide-right",
+    }.get(touch, str(touch))
+
+
+def _touch_reaction_thread():
+    """Give a single touch a local, bounded howl response.
+
+    Detect edges rather than a continuous pressed sensor state.  A reaction is
+    admitted only when the legs are idle, so touching Fluffy cannot enqueue a
+    howl behind body following or another physical action.
+    """
+    previous = "N"
+    last_reaction_at = 0.0
+    while running:
+        try:
+            with dog_lock:
+                touch = dog.dual_touch.read()
+            active = touch != "N"
+            newly_touched = active and touch != previous
+            previous = touch
+            now = time.time()
+            if (
+                newly_touched
+                and now - last_reaction_at >= TOUCH_REACTION_COOLDOWN_SECONDS
+            ):
+                side = _touch_side(touch)
+                reaction = cmd_move_if_idle(
+                    "howling",
+                    speed=70,
+                    internal=False,
+                )
+                accepted = bool(reaction.get("accepted", False))
+                with touch_event_lock:
+                    last_touch_event.update({
+                        "detected": True,
+                        "side": side,
+                        "at_unix": now,
+                        "reaction": "howling" if accepted else "touch_ignored_busy",
+                    })
+                if accepted:
+                    last_reaction_at = now
+                    print(
+                        f"[nox] Touch {side}: local howling reaction accepted",
+                        flush=True,
+                    )
+                else:
+                    print(
+                        f"[nox] Touch {side}: reaction skipped; legs busy",
+                        flush=True,
+                    )
+        except Exception as exc:
+            # Sensor failure must not take down the body controller.
+            print(f"[nox] Touch monitor error: {exc}", flush=True)
+            previous = "N"
+        time.sleep(TOUCH_POLL_SECONDS)
+
+
 def cmd_ears():
     """Sound direction sensor."""
     with dog_lock:
@@ -1817,6 +1895,11 @@ if __name__ == "__main__":
     # Start ultrasonic background thread
     us_thread = threading.Thread(target=_ultrasonic_bg_thread, daemon=True)
     us_thread.start()
+
+    # The dual-touch reflex belongs on the Pi, not the desktop control loop.
+    touch_thread = threading.Thread(target=_touch_reaction_thread, daemon=True)
+    touch_thread.start()
+    print("[nox] Touch howling reflex armed", flush=True)
 
     # Keep main thread alive
     try:
