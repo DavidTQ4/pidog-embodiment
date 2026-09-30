@@ -165,6 +165,49 @@ last_touch_event = {
 }
 TOUCH_POLL_SECONDS = 0.05
 TOUCH_REACTION_COOLDOWN_SECONDS = 4.0
+_touch_sensor = None
+_touch_sensor_error = None
+
+
+class HeadTouchSensor:
+    """Read PiDog's two head touch switches without relying on SDK version."""
+
+    def __init__(self):
+        from robot_hat import Pin
+        self.left = Pin("D2", mode=Pin.IN, pull=Pin.PULL_UP)
+        self.right = Pin("D3", mode=Pin.IN, pull=Pin.PULL_UP)
+
+    def read(self):
+        # These are active-low switches. Mirror SunFounder's D2/D3 mapping.
+        if self.left.value() == 0:
+            return "L"
+        if self.right.value() == 0:
+            return "R"
+        return "N"
+
+
+def _init_touch_sensor():
+    """Use the SDK adapter when present; otherwise create the documented pins."""
+    global _touch_sensor, _touch_sensor_error
+    if hasattr(dog, "dual_touch"):
+        _touch_sensor = dog.dual_touch
+        _touch_sensor_error = None
+        print("[nox] Head touch sensor: PiDog SDK adapter", flush=True)
+        return
+    try:
+        _touch_sensor = HeadTouchSensor()
+        _touch_sensor_error = None
+        print("[nox] Head touch sensor: direct Robot HAT D2/D3", flush=True)
+    except Exception as exc:
+        _touch_sensor = None
+        _touch_sensor_error = f"{type(exc).__name__}: {exc}"
+        print(f"[nox] Head touch sensor unavailable: {_touch_sensor_error}", flush=True)
+
+
+def _read_head_touch():
+    if _touch_sensor is None:
+        raise RuntimeError(_touch_sensor_error or "head touch sensor is unavailable")
+    return _touch_sensor.read()
 
 # ─── Servo Idle Management ───
 _last_activity = time.time()
@@ -275,6 +318,7 @@ def init_dog():
     global dog
     print("[nox] Initializing PiDog...", flush=True)
     dog = Pidog()
+    _init_touch_sensor()
     time.sleep(0.5)
     # Wake up
     dog.do_action('stand', speed=60)
@@ -290,8 +334,10 @@ def init_dog():
         _hw_status.append("imu:ok")
     else:
         _hw_status.append("imu:unavailable")
-    if hasattr(dog, 'dual_touch'):
+    if _touch_sensor is not None:
         _hw_status.append("touch:ok")
+    elif _touch_sensor_error:
+        _hw_status.append(f"touch:error ({_touch_sensor_error})")
     if hasattr(dog, 'ears'):
         _hw_status.append("ears:ok")
     print(f"[nox] Hardware: {', '.join(_hw_status)}", flush=True)
@@ -1329,7 +1375,7 @@ def cmd_sensors():
     # Touch
     try:
         with dog_lock:
-            touch = dog.dual_touch.read()
+            touch = _read_head_touch()
             result["touch"] = touch
     except Exception as e:
         result["touch_error"] = str(e)
@@ -1411,7 +1457,7 @@ def cmd_imu():
 def cmd_touch():
     """Touch sensor state."""
     with dog_lock:
-        touch = dog.dual_touch.read()
+        touch = _read_head_touch()
         return {
             "touch": touch,
             "touched": touch != "N",
@@ -1442,7 +1488,7 @@ def _touch_reaction_thread():
     while running:
         try:
             with dog_lock:
-                touch = dog.dual_touch.read()
+                touch = _read_head_touch()
             active = touch != "N"
             newly_touched = active and touch != previous
             previous = touch
