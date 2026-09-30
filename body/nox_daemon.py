@@ -1457,7 +1457,11 @@ def _touch_reaction_thread():
                     speed=70,
                     internal=False,
                 )
-                accepted = bool(reaction.get("accepted", False))
+                accepted = bool(
+                    reaction.get("ok", False)
+                    and not reaction.get("busy", False)
+                    and reaction.get("accepted", True)
+                )
                 with touch_event_lock:
                     last_touch_event.update({
                         "detected": True,
