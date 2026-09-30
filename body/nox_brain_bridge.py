@@ -413,7 +413,8 @@ def collect_system_status():
         errors["battery"] = sensors.get("battery_error") or sensors.get("error") or "Battery reading unavailable"
     # Forward only known diagnostics, never memory, face data or credentials.
     result["robot"] = {key: sensors[key] for key in (
-        "distance_cm", "distance_valid", "distance_age_s", "posture", "i2c"
+        "distance_cm", "distance_valid", "distance_age_s", "posture", "i2c",
+        "touch_reaction"
     ) if key in sensors}
     if sensors.get("error"):
         errors["robot"] = sensors["error"]
