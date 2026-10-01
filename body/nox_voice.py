@@ -68,6 +68,8 @@ PHRASE_TO_COMMAND = {
 
     # Local social actions and tricks.
     "paw": "hand_shake",
+    # Vosk commonly hears the short command "paw" as "Paul".
+    "paul": "hand_shake",
     "give me your paw": "hand_shake",
     "shake paws": "hand_shake",
     "high five": "high_five",
