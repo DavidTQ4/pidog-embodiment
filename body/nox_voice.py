@@ -68,12 +68,6 @@ PHRASE_TO_COMMAND = {
 
     # Local social actions and tricks.
     "paw": "hand_shake",
-    # Vosk commonly hears the short command "paw" as one of these. They are
-    # accepted only after the Fluffy wake word and therefore never reach the
-    # conversational LLM path.
-    "paul": "hand_shake",
-    "poll": "hand_shake",
-    "pall": "hand_shake",
     "give me your paw": "hand_shake",
     "shake paws": "hand_shake",
     "high five": "high_five",
@@ -545,11 +539,19 @@ def main() -> int:
             if not speech_complete and not command_complete:
                 continue
 
-            command_result = (
-                json.loads(command_recognizer.Result())
-                if command_complete
-                else {}
-            )
+            # Preserve the constrained recogniser's command decision.  The
+            # general recogniser can endpoint first on a short utterance; its
+            # old handling silently discarded the command candidate and sent
+            # the same audio to the conversational LLM.
+            command_from_final = False
+            if command_complete:
+                command_result = json.loads(command_recognizer.Result())
+            elif speech_complete:
+                command_result = json.loads(command_recognizer.FinalResult())
+                command_from_final = True
+            else:
+                command_result = {}
+
             # The constrained grammar decoder can endpoint early on [unk]
             # while the unrestricted decoder is still collecting a longer
             # conversational utterance. Do not discard the shared PCM buffer
@@ -571,6 +573,20 @@ def main() -> int:
                 json.loads(recognizer.Result()) if speech_complete else {}
             )
             text = " ".join(result.get("text", "").split())
+            words = text.lower().strip().split()
+            wake_index = next(
+                (index for index, word in enumerate(words[:3]) if word in WAKE_WORDS),
+                None,
+            )
+            has_wake_word = wake_index is not None
+            # A wake word plus one following token is overwhelmingly a compact
+            # command ("Fluffy paw"), not useful conversational prose.  On
+            # this narrow path, let the constrained decoder's final candidate
+            # own intent even if it did not independently endpoint first.
+            short_wake_utterance = (
+                wake_index is not None
+                and len(words) - wake_index - 1 <= 1
+            )
             command_text = " ".join(
                 command_result.get("text", "").split()
             )
@@ -578,16 +594,23 @@ def main() -> int:
                 command_text,
                 args.stop_without_wake,
             )
-            if command is not None:
+            if command is not None and (
+                command_complete
+                or (command_from_final and short_wake_utterance)
+            ):
                 text = command_text
                 confidence = result_confidence(command_result)
+                if command_from_final:
+                    print(
+                        "[voice] Finalised short command candidate before "
+                        "conversation relay: "
+                        f"free={result.get('text', '')!r} "
+                        f"command={command_text!r}",
+                        flush=True,
+                    )
             else:
                 command = canonical_command(text, args.stop_without_wake)
                 confidence = result_confidence(result)
-            words = text.lower().strip().split()
-            has_wake_word = any(
-                word in WAKE_WORDS for word in words[:3]
-            )
 
             if command is None:
                 if not has_wake_word:
