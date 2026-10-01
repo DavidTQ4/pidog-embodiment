@@ -96,6 +96,10 @@ DEFAULT_VLM_MODEL = "Qwen/Qwen3-VL-8B-Instruct"
 DEFAULT_CONVERSATION_MODEL = "qwen3:8b"
 DEFAULT_ASR_MODEL = "large-v3-turbo"
 DEFAULT_ASR_WORD_CONFIDENCE = 0.70
+# A few individually confident words are not a reliable transcription.  When
+# Vosk supplied a wake-word transcript, retain it unless Whisper covers enough
+# of its own decoded words.
+MIN_WHISPER_WORD_COVERAGE_WITH_VOSK = 0.60
 DEFAULT_YOLO_MODEL = "yolo11n.pt"
 DEFAULT_POSE_MODEL = "yolo11n-pose.pt"
 DEFAULT_PROMPT = (
@@ -1282,8 +1286,10 @@ class VLMObserver:
                 "memory, disk, uptime, robot health, recent touch, or why you "
                 "howled/reacted, call get_system_status. These readings describe "
                 "the Raspberry Pi body, not the Windows desktop brain. A "
-                "touch_reaction field records only the latest local touch event; "
-                "treat it as authoritative and do not claim a touch when it is "
+                "touch_reaction field records only the latest local touch event. "
+                "Never call the status tool or mention a touch reaction unless the "
+                "person asks about touching, a sensor, howling, or why you reacted. "
+                "Treat it as authoritative and do not claim a touch when it is "
                 "absent. State unavailable readings as unknown; battery "
                 "percentage is approximate and charging is not measured."
             )
@@ -1584,13 +1590,21 @@ class VLMObserver:
                         in generic_silence_phrases
                         and len(vosk_transcript.split()) > 2
                     )
+                    weak_whisper = bool(
+                        vosk_transcript
+                        and coverage < MIN_WHISPER_WORD_COVERAGE_WITH_VOSK
+                    )
                     print(
                         "[ASR] Faster-Whisper raw="
                         f"{whisper_raw!r} | retained={whisper_text!r} | "
                         f"words={accepted_words}/{total_words} "
                         f"threshold={self.asr_word_confidence:.2f}"
                     )
-                    if whisper_text and not generic_hallucination:
+                    if (
+                        whisper_text
+                        and not generic_hallucination
+                        and not weak_whisper
+                    ):
                         transcript = whisper_text
                         asr_source = (
                             "Faster-Whisper "
@@ -1602,6 +1616,11 @@ class VLMObserver:
                         print(
                             "[ASR] rejected generic silence hallucination; "
                             "using Pi Vosk transcript"
+                        )
+                    elif weak_whisper:
+                        print(
+                            "[ASR] rejected low-coverage Whisper transcript "
+                            f"({coverage:.0%}); using Pi Vosk transcript"
                         )
                 except Exception as asr_error:
                     print(
