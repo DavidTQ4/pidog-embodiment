@@ -68,8 +68,12 @@ PHRASE_TO_COMMAND = {
 
     # Local social actions and tricks.
     "paw": "hand_shake",
-    # Vosk commonly hears the short command "paw" as "Paul".
+    # Vosk commonly hears the short command "paw" as one of these. They are
+    # accepted only after the Fluffy wake word and therefore never reach the
+    # conversational LLM path.
     "paul": "hand_shake",
+    "poll": "hand_shake",
+    "pall": "hand_shake",
     "give me your paw": "hand_shake",
     "shake paws": "hand_shake",
     "high five": "high_five",
