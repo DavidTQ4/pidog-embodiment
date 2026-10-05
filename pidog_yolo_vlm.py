@@ -143,11 +143,13 @@ PERSON_OBSERVATION_REFUSAL = (
 # this guard removes any output that still makes a visual emotion/intent claim.
 PERSON_OBSERVATION_GUARD_PATTERNS = (
     re.compile(
-        r"\b(?:seems?|appears?|looks?|feels?)\s+(?:very\s+|really\s+|quite\s+)?"
+        r"\b(?:seems?|appears?|looks?|feels?)\s+(?:to\s+be\s+)?"
+        r"(?:very\s+|really\s+|quite\s+)?"
         r"(?:happy|sad|anxious|nervous|bored|excited|upset|angry|afraid|scared|"
         r"worried|stressed|distressed|frustrated|disappointed|confused|"
         r"embarrassed|ashamed|lonely|depressed|tired|fatigued|interested|"
-        r"engaged)\b",
+        r"engaged|joyful|delighted|miserable|content|surprised|disgusted|"
+        r"contemptuous|amused|satisfied)\b",
         re.IGNORECASE,
     ),
     re.compile(
@@ -155,7 +157,18 @@ PERSON_OBSERVATION_GUARD_PATTERNS = (
         r"(?:happy|sad|anxious|nervous|bored|excited|upset|angry|afraid|scared|"
         r"worried|stressed|distressed|frustrated|disappointed|confused|"
         r"embarrassed|ashamed|lonely|depressed|tired|fatigued|interested|"
-        r"engaged)\b",
+        r"engaged|joyful|delighted|miserable|content|surprised|disgusted|"
+        r"contemptuous|amused|satisfied)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?:they|he|she|someone|the person|the child|the pupil|the student|"
+        r"the visitor)\s*(?:'re|’re)\s+"
+        r"(?:happy|sad|anxious|nervous|bored|excited|upset|angry|afraid|scared|"
+        r"worried|stressed|distressed|frustrated|disappointed|confused|"
+        r"embarrassed|ashamed|lonely|depressed|tired|fatigued|interested|"
+        r"engaged|joyful|delighted|miserable|content|surprised|disgusted|"
+        r"contemptuous|amused|satisfied)\b",
         re.IGNORECASE,
     ),
     re.compile(
