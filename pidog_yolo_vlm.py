@@ -135,6 +135,56 @@ DEFAULT_PROMPT = (
     "speaking aloud."
 )
 
+PERSON_OBSERVATION_REFUSAL = (
+    "I can describe visible expressions and actions, but I cannot determine "
+    "how someone feels or what they intend from appearance."
+)
+# Defence in depth for school demonstrations: prompts guide the model, while
+# this guard removes any output that still makes a visual emotion/intent claim.
+PERSON_OBSERVATION_GUARD_PATTERNS = (
+    re.compile(
+        r"\\b(?:seems?|appears?|looks?|feels?)\\s+(?:very\\s+|really\\s+|quite\\s+)?"
+        r"(?:happy|sad|anxious|nervous|bored|excited|upset|angry|afraid|scared|"
+        r"worried|stressed|distressed|frustrated|disappointed|confused|"
+        r"embarrassed|ashamed|lonely|depressed|tired|fatigued|interested|"
+        r"engaged)\\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\\b(?:is|are|was|were)\\s+(?:very\\s+|really\\s+|quite\\s+)?"
+        r"(?:happy|sad|anxious|nervous|bored|excited|upset|angry|afraid|scared|"
+        r"worried|stressed|distressed|frustrated|disappointed|confused|"
+        r"embarrassed|ashamed|lonely|depressed|tired|fatigued|interested|"
+        r"engaged)\\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\\b(?:want(?:s|ed)?|intend(?:s|ed)?|plan(?:s|ned)?|try(?:ing|ies|ied)?)\\s+"
+        r"(?:to\\s+)?(?:interact|play|talk|engage|join|participate|leave|go|help)\\b",
+        re.IGNORECASE,
+    ),
+)
+
+
+def guard_person_observation_text(text: str) -> str:
+    """Remove visual emotion/intent inferences before they are stored or spoken."""
+    if not text:
+        return text
+    safe_sentences: list[str] = []
+    blocked = 0
+    for sentence in re.split(r"(?<=[.!?])\\s+", text.strip()):
+        if any(pattern.search(sentence) for pattern in PERSON_OBSERVATION_GUARD_PATTERNS):
+            blocked += 1
+            continue
+        safe_sentences.append(sentence)
+    if blocked:
+        print(
+            "[PERSON OBSERVATION GUARD] Removed "
+            f"{blocked} emotion/intent inference sentence(s)"
+        )
+    return " ".join(safe_sentences) if safe_sentences else PERSON_OBSERVATION_REFUSAL
+
+
 FLUFFY_SELF_KNOWLEDGE = (
     "You are Fluffy, an experimental embodied SunFounder PiDog V2 quadruped. "
     "Your body controller runs on a Raspberry Pi 4, while computationally "
@@ -912,6 +962,7 @@ class VLMObserver:
                 skip_special_tokens=True,
                 clean_up_tokenization_spaces=False,
             )[0].strip()
+            result = guard_person_observation_text(result)
             seconds = time.perf_counter() - started
             with self.lock:
                 self.state.text = result or "Model returned an empty response"
@@ -966,10 +1017,19 @@ class VLMObserver:
             "above or below from this camera frame only; do not swap the "
             "viewer perspective, infer a person's left/right, or infer a fixed "
             "body/world direction. Mention relevant people, objects, activities, "
-            "visible obstacles and anything the person may be showing you. Do "
-            "not issue commands, infer the speaker's identity, or claim to see "
-            "outside the frame. YOLO detections are fallible hints. Distances "
-            "are box-size estimates, not measured depth.\n\nRecent YOLO "
+            "visible obstacles and anything the person may be showing you. For "
+            "people, describe only directly observable expressions, gestures, "
+            "posture, movements and gaze direction. Never infer or state emotion, "
+            "intention, feeling, mood, mental state, personality, psychological "
+            "characteristic or health state from appearance, facial expression, "
+            "gaze, posture, voice or other biometric information. Do not say or "
+            "imply that someone is happy, sad, anxious, bored, excited, upset, "
+            "interested, tired, engaged or wants to interact. If asked how "
+            "someone feels from this image, say that emotional state cannot be "
+            "determined from visual appearance. Do not issue commands, infer the "
+            "speaker's identity, or claim to see outside the frame. YOLO "
+            "detections are fallible hints. Distances are box-size estimates, "
+            "not measured depth.\n\nRecent YOLO "
             "detections close to this frame:\n"
             + json.dumps(detection_payload, ensure_ascii=False)
         )
@@ -1003,6 +1063,7 @@ class VLMObserver:
             skip_special_tokens=True,
             clean_up_tokenization_spaces=False,
         )[0].strip()
+        description = guard_person_observation_text(description)
         elapsed = time.perf_counter() - started
         if not description:
             return {
@@ -1665,7 +1726,13 @@ class VLMObserver:
                 "camera in your movable head: visual left/right always means "
                 "image-left/image-right from your current head view, never the "
                 "person's left/right or a fixed body/world direction. "
-                "A visible identity is not proof of who is speaking. Never claim "
+                "A visible identity is not proof of who is speaking. For people, "
+                "describe only observable expressions, gestures, posture, movement "
+                "and gaze direction. Never infer or state emotion, intention, "
+                "feeling, mood, mental state, personality, psychological "
+                "characteristic or health state from appearance or biometric "
+                "information. If asked how someone feels based only on appearance, "
+                "say you cannot determine that. Never claim "
                 "that a requested action happened unless its confirmed state or "
                 "tool result says so. You may use perform_robot_action for a "
                 "small stationary gesture when the person explicitly requests "
@@ -1765,6 +1832,7 @@ class VLMObserver:
                 )[0].strip()
             if not result:
                 result = "I am not sure how to answer that yet."
+            result = guard_person_observation_text(result)
             result = sanitise_spoken_text(result)
 
             seconds = time.perf_counter() - started
