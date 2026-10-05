@@ -143,24 +143,24 @@ PERSON_OBSERVATION_REFUSAL = (
 # this guard removes any output that still makes a visual emotion/intent claim.
 PERSON_OBSERVATION_GUARD_PATTERNS = (
     re.compile(
-        r"\\b(?:seems?|appears?|looks?|feels?)\\s+(?:very\\s+|really\\s+|quite\\s+)?"
+        r"\b(?:seems?|appears?|looks?|feels?)\s+(?:very\s+|really\s+|quite\s+)?"
         r"(?:happy|sad|anxious|nervous|bored|excited|upset|angry|afraid|scared|"
         r"worried|stressed|distressed|frustrated|disappointed|confused|"
         r"embarrassed|ashamed|lonely|depressed|tired|fatigued|interested|"
-        r"engaged)\\b",
+        r"engaged)\b",
         re.IGNORECASE,
     ),
     re.compile(
-        r"\\b(?:is|are|was|were)\\s+(?:very\\s+|really\\s+|quite\\s+)?"
+        r"\b(?:is|are|was|were)\s+(?:very\s+|really\s+|quite\s+)?"
         r"(?:happy|sad|anxious|nervous|bored|excited|upset|angry|afraid|scared|"
         r"worried|stressed|distressed|frustrated|disappointed|confused|"
         r"embarrassed|ashamed|lonely|depressed|tired|fatigued|interested|"
-        r"engaged)\\b",
+        r"engaged)\b",
         re.IGNORECASE,
     ),
     re.compile(
-        r"\\b(?:want(?:s|ed)?|intend(?:s|ed)?|plan(?:s|ned)?|try(?:ing|ies|ied)?)\\s+"
-        r"(?:to\\s+)?(?:interact|play|talk|engage|join|participate|leave|go|help)\\b",
+        r"\b(?:want(?:s|ed)?|intend(?:s|ed)?|plan(?:s|ned)?|try(?:ing|ies|ied)?)\s+"
+        r"(?:to\s+)?(?:interact|play|talk|engage|join|participate|leave|go|help)\b",
         re.IGNORECASE,
     ),
 )
@@ -172,7 +172,7 @@ def guard_person_observation_text(text: str) -> str:
         return text
     safe_sentences: list[str] = []
     blocked = 0
-    for sentence in re.split(r"(?<=[.!?])\\s+", text.strip()):
+    for sentence in re.split(r"(?<=[.!?])\s+", text.strip()):
         if any(pattern.search(sentence) for pattern in PERSON_OBSERVATION_GUARD_PATTERNS):
             blocked += 1
             continue
